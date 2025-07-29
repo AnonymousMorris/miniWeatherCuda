@@ -19,6 +19,30 @@ jobs:
         bash -c "source ./cmake_andes_gnu_cpu.sh"
         make
     
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-artifacts
+        path: c/build/
+        retention-days: 1
+
+  test:
+    runs-on: self-hosted
+    needs: build
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: build-artifacts
+        path: c/build/
+    
+    - name: Restore executable permissions
+      run: |
+        chmod +x c/build/*
+    
     - name: Run tests
       run: |
         cd c/build
