@@ -16,7 +16,7 @@ jobs:
     - name: Build project
       run: |
         cd c/build
-        source ./cmake_andes_gnu_cpu.sh
+        bash -c "source ./cmake_andes_gnu_cpu.sh"
         make
     
     - name: Run tests
