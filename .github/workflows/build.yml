@@ -1,0 +1,25 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: self-hosted
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Build project
+      run: |
+        cd c/build
+        source ./cmake_andes_gnu_cpu.sh
+        make
+    
+    - name: Run tests
+      run: |
+        cd c/build
+        make test
