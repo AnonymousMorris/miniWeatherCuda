@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.0)
-project(miniWeather CXX)
+project(miniWeather CXX CUDA)
 
 enable_testing()
 
@@ -153,6 +153,40 @@ if (NOT ("${OPENMP45_FLAGS}" STREQUAL "") )
   endif()
 
   add_test(NAME OPENMP45_TEST COMMAND ./check_output.sh ./openmp45_test 1e-13 4.5e-5 ) 
+endif()
+
+
+
+############################################################
+## Compile the MPI + CUDA version 
+############################################################
+if (CMAKE_CUDA_COMPILER)
+  add_executable(cuda miniWeather_mpi_cuda.cu)
+  set_target_properties(cuda PROPERTIES 
+    # COMPILE_FLAGS "${EXE_DEFS} -g -G"
+    COMPILE_FLAGS "${EXE_DEFS} -O3"
+    CUDA_ARCHITECTURES "70;75;80")
+
+  add_executable(cuda_test miniWeather_mpi_cuda.cu)
+  set_target_properties(cuda_test PROPERTIES 
+    COMPILE_FLAGS "${TEST_DEFS} -O3"
+    CUDA_ARCHITECTURES "70;75;80")
+
+  if (NOT ("${LDFLAGS}" STREQUAL "") )
+    target_link_libraries(cuda      "${LDFLAGS}")
+    target_link_libraries(cuda_test "${LDFLAGS}")
+  endif()
+  if (NOT ("${MPI_LINK_FLAGS}" STREQUAL "") )
+    target_link_libraries(cuda      "${MPI_LINK_FLAGS}")
+    target_link_libraries(cuda_test "${MPI_LINK_FLAGS}")
+  endif()
+  if ("${CUDA_LINK_FLAGS}" STREQUAL "")
+    SET(CUDA_LINK_FLAGS ${CUDA_FLAGS})
+  endif()
+  target_link_libraries(cuda      "${CUDA_LINK_FLAGS}")
+  target_link_libraries(cuda_test "${CUDA_LINK_FLAGS}")
+
+  add_test(NAME CUDA_TEST COMMAND ./check_output.sh ./cuda_test 1e-13 4.5e-5 ) 
 endif()
 
 

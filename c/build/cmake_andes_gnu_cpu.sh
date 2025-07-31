@@ -10,6 +10,7 @@ cmake -DCMAKE_CXX_COMPILER=mpic++                                               
       -DCMAKE_POLICY_VERSION_MINIMUM=3.5                                              \
       -DCXXFLAGS="-Ofast -march=native -DNO_INFORM -std=c++11 -I${OLCF_PARALLEL_NETCDF_ROOT}/include"   \
       -DLDFLAGS="-L${OLCF_PARALLEL_NETCDF_ROOT}/lib -lpnetcdf"                        \
+      -DMPI_LINK_FLAGS="-lmpi"                                                        \
       -DOPENMP_FLAGS="-fopenmp"                                                       \
       -DOPENACC_FLAGS="-fopenacc"                                                     \
       -DNX=200                                                                        \
