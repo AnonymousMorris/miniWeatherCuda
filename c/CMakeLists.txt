@@ -164,12 +164,12 @@ if (CMAKE_CUDA_COMPILER)
   add_executable(cuda miniWeather_mpi_cuda.cu)
   set_target_properties(cuda PROPERTIES 
     # COMPILE_FLAGS "${EXE_DEFS} -g -G"
-    COMPILE_FLAGS "${EXE_DEFS} -O3"
+    COMPILE_FLAGS "${EXE_DEFS} -fmad=false -O3"
     CUDA_ARCHITECTURES "70;75;80")
 
   add_executable(cuda_test miniWeather_mpi_cuda.cu)
   set_target_properties(cuda_test PROPERTIES 
-    COMPILE_FLAGS "${TEST_DEFS} -O3"
+    COMPILE_FLAGS "${TEST_DEFS} -fmad=false -O3"
     CUDA_ARCHITECTURES "70;75;80")
 
   if (NOT ("${LDFLAGS}" STREQUAL "") )

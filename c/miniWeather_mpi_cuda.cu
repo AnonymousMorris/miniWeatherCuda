@@ -152,6 +152,45 @@ double *dbg_state_tmp;
 double *dbg_flux;
 double *dbg_tend;
 
+double halo_err = 0;
+double flux_err = 0;
+double tend_err = 0;
+double gravity_err = 0 ;
+double step_err = 0;
+double grav_square_err = 0;
+double grav_sqrt_err = 0;
+double grav_cos_err = 0;
+
+double grav_square_max_err = 0;
+double grav_sqrt_max_err = 0;
+double grav_cos_max_err = 0;
+double grav_tend_max_err = 0;
+
+long long halo_err_cnt = 0;
+long long flux_err_cnt = 0;
+long long gravity_err_cnt = 0;
+long long step_err_cnt = 0;
+long long tend_err_cnt = 0;
+
+double *dbg_grav_square;
+double *dbg_grav_sqrt;
+double *dbg_grav_cos;
+double *dbg_grav_wpert;
+
+double *h_dbg_grav_square;
+double *h_dbg_grav_sqrt;
+double *h_dbg_grav_cos;
+double *h_dbg_grav_wpert;
+
+double *d_dbg_grav_square;
+double *d_dbg_grav_sqrt;
+double *d_dbg_grav_cos;
+double *d_dbg_grav_wpert;
+
+__constant__ double *d_dbg_grav_square_ptr;
+__constant__ double *d_dbg_grav_sqrt_ptr;
+__constant__ double *d_dbg_grav_cos_ptr;
+__constant__ double *d_dbg_grav_wpert_ptr;
 
 // How is this not in the standard?!
 double dmin(double a, double b) {
@@ -321,6 +360,29 @@ int main(int argc, char **argv) {
         printf("d_te:   %.17g\n", (te - te0) / te0);
     }
 
+    printf("Total Cumulative Err:\n");
+    printf("halo_err: %.17le \nflux_err: %.17le\ntend: %.17le, \ngravity: %.17le, \nstep: %.17le\n", 
+           halo_err, flux_err, tend_err, gravity_err, step_err);
+    printf("grav_square_err: %.17le \ngrav_sqrt_err: %.17le \n grav_cos_err: %.17le \n\n", grav_square_err, grav_sqrt_err, grav_cos_err);
+
+
+    printf("Average Error:\n");
+    printf("halo_err: %.17le \nflux_err: %.17le\ntend: %.17le, \ngravity: %.17le, \nstep: %.17le\n", 
+           halo_err,
+           (flux_err / flux_size) / flux_err_cnt,
+           (tend_err / tend_size) / tend_err_cnt,
+           (gravity_err / tend_size) / gravity_err_cnt, 
+           (step_err / state_size) / step_err_cnt);
+
+    printf("grav_square_err: %.17le \ngrav_sqrt_err: %.17le \n grav_cos_err: %.17le \n\n", 
+           (grav_square_err / tend_size) / gravity_err_cnt, 
+           (grav_sqrt_err / tend_size) / gravity_err_cnt, 
+           (grav_cos_err / tend_size) / gravity_err_cnt);
+
+    printf("Max Cell Error: \n");
+    printf("grav_square: %.17le, \ngrav_sqrt: %.17le, \ngrav_cos: %.17le", 
+           grav_square_max_err, grav_sqrt_max_err, grav_cos_max_err);
+
     finalize();
 }
 
@@ -365,33 +427,10 @@ void semi_discrete_step_cpu( double *state_init, double *state_out, double dt, d
   for (ll=0; ll<NUM_VARS; ll++) {
     for (k=0; k<nz; k++) {
       for (i=0; i<nx; i++) {
-        if (data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
-          x = (i_beg + i+0.5)*dx;
-          z = (k_beg + k+0.5)*dz;
-          // Using sample_ellipse_cosine requires "acc routine" in OpenACC and "declare target" in OpenMP offload
-          // Neither of these are particularly well supported. So I'm manually inlining here
-          // wpert = sample_ellipse_cosine( x,z , 0.01 , xlen/8,1000., 500.,500. );
-          {
-            x0   = xlen/8;
-            z0   = 1000;
-            xrad = 500;
-            zrad = 500;
-            amp  = 0.01;
-            //Compute distance from bubble center
-            dist = sqrt( ((x-x0)/xrad)*((x-x0)/xrad) + ((z-z0)/zrad)*((z-z0)/zrad) ) * pi / 2.;
-            //If the distance from bubble center is less than the radius, create a cos**2 profile
-            if (dist <= pi / 2.) {
-              wpert = amp * pow(cos(dist),2.);
-            } else {
-              wpert = 0.;
-            }
-          }
-          indw = ID_WMOM*nz*nx + k*nx + i;
-          tend[indw] += wpert*hy_dens_cell[hs+k];
-        }
         inds = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
         indt = ll*nz*nx + k*nx + i;
-        bool debug_this = ll == 3 && i == 44 && k == 17;
+        bool debug_this = false;
+        // bool debug_this = ll == 2 && i == 23 && k == 5;
         state_out[inds] = state_init[inds] + dt * tend[indt];
         if (debug_this) {
           printf("state_out: %.17g, state_init: %.17g, dt: %.17g, tend: %.17g\n", state_out[inds], state_init[inds], dt, tend[indt]);
@@ -400,10 +439,64 @@ void semi_discrete_step_cpu( double *state_init, double *state_out, double dt, d
     }
   }
 }
+
+void gravity_waves_cpu(double *state_init, double *state_out, double dt, double *tend) {
+  int i, k, ll, inds, indt, indw, dbg_ind;
+  double x, z, wpert, dist, x0, z0, xrad, zrad, amp;
+
+  for (ll=0; ll<NUM_VARS; ll++) {
+    for (k=0; k<nz; k++) {
+      for (i=0; i<nx; i++) {
+        if (data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
+          x = (i_beg + i+0.5)*dx;
+          z = (k_beg + k+0.5)*dz;
+          // Using sample_ellipse_cosine requires "acc routine" in OpenACC and "declare target" in OpenMP offload
+          // Neither of these are particularly well supported. So I'm manually inlining here
+          // wpert = sample_ellipse_cosine( x,z , 0.01 , xlen/8,1000., 500.,500. );
+          // {
+            x0   = xlen/8;
+            z0   = 1000;
+            xrad = 500;
+            zrad = 500;
+            amp  = 0.01;
+            //Compute distance from bubble center
+            double square = ((x-x0)/xrad)*((x-x0)/xrad) + ((z-z0)/zrad)*((z-z0)/zrad);
+            dist = sqrt( ((x-x0)/xrad)*((x-x0)/xrad) + ((z-z0)/zrad)*((z-z0)/zrad) ) * pi / 2.;
+            //If the distance from bubble center is less than the radius, create a cos**2 profile
+            if (dist < pi / 2.) {
+              wpert = amp * pow(cos(dist),2.);
+            } else {
+              wpert = 0.;
+            }
+            dbg_ind = ll * nz * nx + k * nx + i;
+            dbg_grav_square[dbg_ind] = square;
+            dbg_grav_sqrt[dbg_ind] = dist;
+            dbg_grav_cos[dbg_ind] = wpert;
+          // }
+          indw = ID_WMOM*nz*nx + k*nx + i;
+          // bool debug_this = (ll == 0 && i == 21 && k == 12);
+          // if (debug_this) {
+          //   printf("CPU: initial tend: %.17le ", tend[indw]);
+          // }
+          tend[indw] += wpert*hy_dens_cell[hs+k];
+          bool debug_this = false;
+          // bool debug_this = (ll == 0 && i == 21 && k == 12);
+          if (debug_this) {
+            printf("ll: %d, i: %d, k: %d, idx: %d\n", ll, i, k, dbg_ind);
+            printf("CPU: square: %.17le, dist=%.17le, cos(dist): %.17le, tend: %.17le, wpert: %.17le, d_hy_dens_cell[indw]=%.17g\n", 
+                   square, dist, cos(dist), tend[indw], wpert, hy_dens_cell[hs + k]);
+            printf("dbg_square[idx]: %.17le\n", dbg_grav_square[dbg_ind]);
+          }
+        }
+      }
+    }
+  }
+}
+
 __global__ void compute_gravity_waves_discrete_step(double *state_init, double *state_out,
                                                     double *d_tend, double *d_hy_dens_cell) {
-    int i, k, ll, indw;
-    double x, z, wpert, dist, x0, z0, xrad, zrad, amp;
+    int i, k, ll, indw, dbg_ind;
+    volatile double x, z, wpert, dist, x0, z0, xrad, zrad, amp;
 
     ll = blockIdx.z * blockDim.z + threadIdx.z;
     k = blockIdx.y * blockDim.y + threadIdx.y;
@@ -417,25 +510,52 @@ __global__ void compute_gravity_waves_discrete_step(double *state_init, double *
         // So I'm manually inlining here wpert = sample_ellipse_cosine( x,z , 0.01 ,
         // xlen/8,1000., 500.,500. );
         {
-            x0 = xlen / 8;
-            z0 = 1000;
-            xrad = 500;
-            zrad = 500;
+            x0 = xlen / 8.0;
+            z0 = 1000.0;
+            xrad = 500.0;
+            zrad = 500.0;
             amp = 0.01;
             // Compute distance from bubble center
             dist = sqrt(((x - x0) / xrad) * ((x - x0) / xrad) +
                         ((z - z0) / zrad) * ((z - z0) / zrad)) *
                    pi / 2.;
+
+            double square = ((x-x0)/xrad)*((x-x0)/xrad) + ((z-z0)/zrad)*((z-z0)/zrad);
+            // dist = pow((((x - x0) / xrad) * ((x - x0) / xrad) +
+            //             ((z - z0) / zrad) * ((z - z0) / zrad)), 0.5) *
+            //        pi / 2.;
+
+
+            // taking the denominator out of sqrt
+            // dist = (sqrt((x - x0) * (x - x0) + (z - z0) * (z - z0)) / xrad)* (pi / 2) ;
+            
             // If the distance from bubble center is less than the radius, create a
             // cos**2 profile
-            if (dist <= pi / 2.) {
+            if (dist < pi / 2.) {
                 wpert = amp * pow(cos(dist), 2.);
+                // wpert = amp * (cos(dist) * cos(dist));
             } else {
                 wpert = 0.;
             }
             indw = ID_WMOM * d_nz * d_nx + k * d_nx + i;
+            // bool debug_this = (ll == 0 && i == 21 && k == 12);
+            // if (debug_this) {
+            //     printf("GPU: initial tend: %.17le ", d_tend[indw]);
+            // }
 
-            d_tend[indw] += wpert * d_hy_dens_cell[hs + k];
+            dbg_ind = ll * d_nz * d_nx + k * d_nx + i;
+            d_dbg_grav_square_ptr[dbg_ind] = square;
+            d_dbg_grav_sqrt_ptr[dbg_ind] = dist;
+            d_dbg_grav_cos_ptr[dbg_ind] = wpert;
+            atomicAdd(&d_tend[indw], wpert * d_hy_dens_cell[hs + k]);
+            // d_tend[indw] += wpert * d_hy_dens_cell[hs + k];
+
+            bool debug_this = false;
+            // bool debug_this = (i == 21 && k == 12);
+            if (debug_this) {
+                printf("square: %.17le, dist=%.17le, cos(dist): %.17le, tend: %.17le, wpert: %.17le, d_hy_dens_cell[indw]=%.17g\n", 
+                       square, dist, cos(dist), d_tend[indw], wpert, d_hy_dens_cell[hs + k]);
+            }
         }
     }
 }
@@ -453,7 +573,8 @@ __global__ void semi_discrete_step_kernel(double *d_state_init, double *d_state_
         indt = ll * d_nz * d_nx + k * d_nx + i;
 
         d_state_out[inds] = d_state_init[inds] + dt * d_tend[indt];
-        bool debug_this = ll == 3 && i == 44 && k == 17;
+        bool debug_this = false;
+        // bool debug_this = ll == 2 && i == 23 && k == 5;
         if (debug_this) {
             printf("state_out: %.17g, state_init: %.17g, dt: %.17g, tend: %.17g\n", d_state_out[inds], d_state_init[inds], dt, d_tend[indt]);
         }
@@ -466,29 +587,86 @@ __host__ void semi_discrete_step_host(double *d_state_in, double *d_state_out, d
     cudaMemcpy(state_tmp, d_state_out, state_size * sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy(tend, d_tend, tend_size * sizeof(double), cudaMemcpyDeviceToHost);
     // Apply the tendencies to the fluid state
-    dim3 block_dim(1024, 1, 1);
+    dim3 block_dim(512, 1, 1);
     dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, nz, NUM_VARS);
     if (data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
         compute_gravity_waves_discrete_step<<<grid_dim, block_dim>>>(d_state_in, d_state_out,
                                                                      d_tend, d_hy_dens_cell);
+        gravity_waves_cpu(state, d_state_out, dt, tend);
+        CHECK_CUDA_KERNEL();
+        cudaMemcpy(dbg_tend, d_tend, tend_size * sizeof(double), cudaMemcpyDeviceToHost);
+        int ll, k, i;
+        gravity_err_cnt++;
+        for (ll=0; ll<NUM_VARS; ll++) {
+          for (k=0; k<nz; k++) {
+            for (i=0; i<nx; i++) {
+              int indw = ID_WMOM *nz*nx + k*nx + i;
+              int dbg_ind = ll*nz*nx + k*nx + i;
+              double exp = tend[indw];
+              double actual = dbg_tend[indw];
+              if (tend[indw] != dbg_tend[indw]) {
+                if (ll == 0) {
+                  gravity_err += fabs(exp - actual);
+                }
+
+                CUDA_CHECK(cudaMemcpy(h_dbg_grav_sqrt, d_dbg_grav_sqrt, tend_size * sizeof(double), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(h_dbg_grav_cos, d_dbg_grav_cos, tend_size * sizeof(double), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(h_dbg_grav_square, d_dbg_grav_square, tend_size * sizeof(double), cudaMemcpyDeviceToHost));
+                double exp_grav_square = dbg_grav_square[dbg_ind];
+                double exp_grav_sqrt = dbg_grav_sqrt[dbg_ind];
+                double exp_grav_cos = dbg_grav_cos[dbg_ind];
+                double actual_grav_square = h_dbg_grav_square[dbg_ind];
+                double actual_grav_sqrt = h_dbg_grav_sqrt[dbg_ind];
+                double actual_grav_cos = h_dbg_grav_cos[dbg_ind];
+                grav_square_err += fabs(exp_grav_square - actual_grav_square);
+                grav_sqrt_err += fabs(exp_grav_sqrt - actual_grav_sqrt);
+                grav_cos_err += fabs(exp_grav_cos - actual_grav_cos);
+                // if (grav_square_max_err < fabs(exp_grav_square - actual_grav_square)) {
+                if (grav_tend_max_err < fabs(exp - actual)) {
+                  double x = (d_i_beg + i + 0.5) * dx;
+                  double z = (d_k_beg + k + 0.5) * dz;
+                  printf("input x: %.17le, z: %.17le dbg_idx: %d\n", x, z, dbg_ind);
+                  printf("ll: %d k: %d, i: %d \n", ll, k, i);
+                  printf("exp tend: %.17le, actual tend: %.17le\n", exp, actual);
+                  printf("exp square: %.17le, actual square: %.17le\n", exp_grav_square, actual_grav_square);
+                  printf("exp sqrt: %.17le, actual sqrt: %.17le\n", exp_grav_sqrt, actual_grav_sqrt);
+                  printf("exp cos: %.17le, actual cos: %.17le\n", exp_grav_cos, actual_grav_cos);
+                }
+                grav_square_max_err = fmax(grav_square_max_err, fabs(exp_grav_square - actual_grav_square));
+                grav_sqrt_max_err = fmax(grav_sqrt_max_err, fabs(exp_grav_sqrt - actual_grav_sqrt));
+                grav_cos_max_err = fmax(grav_cos_max_err, fabs(exp_grav_cos - actual_grav_cos));
+                grav_tend_max_err = fmax(grav_tend_max_err, fabs(exp - actual));
+                // printf("Gravity Wave Error\n");
+                // printf("\n state indt: %d. ll: %d, i: %d, k: %d, Expected: %.17g, Actual: %.17g\n", 
+                //            indw, ll, i, k, tend[indw], dbg_tend[indw]);
+                // exit(1);
+              }
+            }
+          }
+        }
     }
+    cudaMemcpy(state, d_state_in, state_size * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(state_tmp, d_state_out, state_size * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(tend, d_tend, tend_size * sizeof(double), cudaMemcpyDeviceToHost);
     semi_discrete_step_kernel<<<grid_dim, block_dim>>>(d_state_in, d_state_out, d_tend, dt);
-
-
 
     semi_discrete_step_cpu(state, state_tmp, dt, tend);
     cudaMemcpy(dbg_state, d_state_out, state_size * sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy(dbg_tend, d_tend, tend_size * sizeof(double), cudaMemcpyDeviceToHost);
 
+    step_err_cnt++;
     for (int ll = 0; ll < NUM_VARS; ll++) {
-        for (int k = 0; k < nz + 2 * hs; k++) {
+        for (int k = 0; k < nz; k++) {
             for (int i = 0; i < nx; i++ ) {
                 int indt = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
-                if (state_tmp[indt] != dbg_state[indt]) {
-                    printf("Gravity Waves: %d\n", data_spec_int == DATA_SPEC_GRAVITY_WAVES);
-                    printf("\n state indt: %d. ll: %d, i: %d, k: %d, Expected: %.17g, Actual: %.17g\n", 
-                           indt, ll, i, k, state_tmp[indt], dbg_state[indt]);
-                    exit(1);
+                double exp = state_tmp[indt];
+                double actual = dbg_state[indt];
+                if (exp != actual) {
+                    step_err += fabs(exp - actual);
+                    // printf("Gravity Waves: %d\n", data_spec_int == DATA_SPEC_GRAVITY_WAVES);
+                    // printf("\n state indt: %d. ll: %d, i: %d, k: %d, Expected: %.17g, Actual: %.17g\n", 
+                    //        indt, ll, i, k, state_tmp[indt], dbg_state[indt]);
+                    // exit(1);
                 }
             }
         }
@@ -733,21 +911,38 @@ __host__ void compute_tendecies_x_flux_host(double *d_state, double *d_flux, dou
     cudaMemcpy(dbg_tend, d_tend, tend_size * sizeof(double), cudaMemcpyDeviceToHost);
 
 
-    // printf("nx: %d", nx);
-    // for (int ll=0; ll < NUM_VARS; ll++) {
-    //     // if (ll == ID_UMOM) continue;
-    //     for (int k = 0; k < nz; k++) {
-    //         for (int i = 0; i < nx + 1; i++) {
-    //             int indt = ll * (nz + 1) * (nx + 1) + k * (nx + 1) + i;
-    //             if (flux[indt] != dbg_flux[indt]) {
-    //                 printf("\n\nflux indt: %d. ll: %d, i: %d, k: %d, Expected: %.17g, Actual: %.17g\n", 
-    //                        indt, ll, i, k, flux[indt], dbg_flux[indt]);
-    //                 exit(1);
-    //             }
-    //         }
-    //     }
-    // }
+    flux_err_cnt++;
+    for (int ll=0; ll < NUM_VARS; ll++) {
+        // if (ll == ID_UMOM) continue;
+        for (int k = 0; k < nz; k++) {
+            for (int i = 0; i < nx + 1; i++) {
+                int indt = ll * (nz + 1) * (nx + 1) + k * (nx + 1) + i;
+                double exp = flux[indt];
+                double actual = dbg_flux[indt];
+                if (exp != actual) {
+                    flux_err += fabs(exp - actual);
+                    // printf("\n\nflux indt: %d. ll: %d, i: %d, k: %d, Expected: %.17g, Actual: %.17g\n", 
+                    //        indt, ll, i, k, flux[indt], dbg_flux[indt]);
+                    // exit(1);
+                }
+            }
+        }
+    }
 
+}
+
+void compute_tendencies_x_tend_cpu(double* flux, double* tend, double dt) {
+  int i,k,ll,s,inds,indf1,indf2,indt;
+  for (ll=0; ll<NUM_VARS; ll++) {
+    for (k=0; k<nz; k++) {
+      for (i=0; i<nx; i++) {
+        indt  = ll* nz   * nx    + k* nx    + i  ;
+        indf1 = ll*(nz+1)*(nx+1) + k*(nx+1) + i  ;
+        indf2 = ll*(nz+1)*(nx+1) + k*(nx+1) + i+1;
+        tend[indt] = -( flux[indf2] - flux[indf1] ) / dx;
+      }
+    }
+  }
 }
 
 __global__ void compute_tendencies_x_tend_kernel(double *d_flux, double *d_tend, double dt) {
@@ -765,18 +960,37 @@ __global__ void compute_tendencies_x_tend_kernel(double *d_flux, double *d_tend,
     }
 }
 __host__ void compute_tendencies_x_tend_host(double *d_flux, double *d_tend, double dt) {
+
+    cudaMemcpy(flux, d_flux, flux_size * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(tend, d_tend, tend_size * sizeof(double), cudaMemcpyDeviceToHost);
+    compute_tendencies_x_tend_cpu(flux, tend, dt);
+
     dim3 block_dim(1024, 1, 1);
     dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, (nz + block_dim.y - 1) / block_dim.y,
                   NUM_VARS);
 
     compute_tendencies_x_tend_kernel<<<grid_dim, block_dim>>>(d_flux, d_tend, dt);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("Kernel launch failed: %s\n", cudaGetErrorString(err));
-        cudaDeviceSynchronize();
-        exit(1);
+    CHECK_CUDA_KERNEL();
+    cudaMemcpy(dbg_tend, d_tend, tend_size * sizeof(double), cudaMemcpyDeviceToHost);
+
+    tend_err_cnt++;
+    int ll, k, i, indt, indf1, indf2;
+    for (ll=0; ll<NUM_VARS; ll++) {
+        for (k=0; k<nz; k++) {
+            for (i=0; i<nx; i++) {
+                indt  = ll* nz   * nx    + k* nx    + i  ;
+                double exp = tend[indt];
+                double actual = dbg_tend[indt];
+                if (exp != actual) {
+                    tend_err += fabs(exp - actual);
+                    printf("compute_tendencies_x_tend is wrong\n");
+                    printf("Exp: %.17le, Actual: %.17le\n", tend[indt], dbg_tend[indt]);
+                    exit(1);
+                }
+            }
+        }
     }
-    cudaDeviceSynchronize();
+
 }
 
 // Compute the time tendencies of the fluid state using forcing in the x-direction
@@ -927,6 +1141,18 @@ void compute_tendencies_z(double *d_state, double *d_flux, double *d_tend, doubl
     compute_tendencies_z_tend_host(d_state, d_flux, d_tend, dt);
 }
 
+void set_halo_values_x_cpu(double *state) {
+  int k, ll;
+  for (ll=0; ll<NUM_VARS; ll++) {
+    for (k=0; k<nz; k++) {
+      state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + 0      ] = state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + nx+hs-2];
+      state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + 1      ] = state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + nx+hs-1];
+      state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + nx+hs  ] = state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + hs     ];
+      state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + nx+hs+1] = state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + hs+1   ];
+    }
+  }
+}
+
 __global__ void set_halo_values_x_kernel(double *d_state) {
     int k, ll;
     k = blockIdx.x * blockDim.x + threadIdx.x;
@@ -947,18 +1173,55 @@ __global__ void set_halo_values_x_kernel(double *d_state) {
     }
 }
 
+__global__ void print_d_state(double *d_state, int idx) {
+    printf("d_state[idx]: %.17le\n", d_state[idx]);
+}
+
 __host__ void set_halo_values_x_host(double *d_state) {
+    int idx = 3 * (nx + 2 * hs) * (nz + 2 * hs) + 0 * (nx + 2 * hs) + 47;
+    // printf("before memcpy: state[idx]: %.17le\n", state[idx]);
+    // printf("before memcpy: ");
+    // print_d_state<<<1, 1>>>(d_state, idx);
+    // cudaDeviceSynchronize();
+    // cudaMemcpy(state, d_state, state_size * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(state, d_state, (nx + 2 * hs) * (nz + 2 * hs) * NUM_VARS * sizeof(double), cudaMemcpyDeviceToHost);
+    // cudaDeviceSynchronize();
+    // printf("after memcpy: state[idx]: %.17le\n", state[idx]);
+    // printf("after memcpy: ");
+    // print_d_state<<<1, 1>>>(d_state, idx);
+    set_halo_values_x_cpu(state);
+    cudaDeviceSynchronize();
+
     dim3 block_dim(1024, 1, 1);
     dim3 grid_dim((nz + block_dim.x - 1) / block_dim.x, NUM_VARS, 1);
 
     set_halo_values_x_kernel<<<grid_dim, block_dim>>>(d_state);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("Kernel launch failed: %s\n", cudaGetErrorString(err));
-        cudaDeviceSynchronize();
+    // print_d_state<<<1, 1>>>(d_state, idx);
+    CHECK_CUDA_KERNEL();
+
+    if (data_spec_int == DATA_SPEC_INJECTION) {
+        printf("ahhhhhhhhhhhhhh");
+        printf("I didn't implement data spec injection");
         exit(1);
     }
-    cudaDeviceSynchronize();
+
+    cudaMemcpy(dbg_state, d_state, state_size * sizeof(double), cudaMemcpyDeviceToHost);
+    int ll, i, k;
+    for (ll=0; ll<NUM_VARS; ll++) {
+        for (k=0; k<nz; k++) {
+            for (i = 0; i < nx + 2 * hs; i++) {
+                double exp = state[ll * (nx + 2 * hs) * (nz + 2 * hs) + (k + hs) * (nx + 2 * hs) + i];
+                double actual = dbg_state[ll * (nx + 2 * hs) * (nz + 2 * hs) + (k + hs) * (nx + 2 * hs) + i];
+                if (exp != actual) {
+                    halo_err += fabs(exp - actual);
+                    printf("set_halo_values_x is wrong\n");
+                    printf("ll: %d, i: %d, k: %d\n", ll, i, k);
+                    printf("Exp: %.17le, Actual: %.17le", exp, actual);
+                    exit(1);
+                }
+            }
+        }
+    }
 }
 
 // Set this MPI task's halo values in the x-direction. This routine will require MPI
@@ -968,7 +1231,6 @@ void set_halo_values_x(double *state, double *d_state) {
 
     if (nranks == 1) {
         set_halo_values_x_host(d_state);
-
     } else {
         MPI_Request req_r[2], req_s[2];
 
@@ -1181,6 +1443,16 @@ void init(int *argc, char ***argv) {
     dbg_flux = (double *) malloc(flux_size * sizeof(double));
     dbg_tend = (double *) malloc(tend_size * sizeof(double));
 
+    dbg_grav_square = (double *) malloc(tend_size * sizeof(double));
+    dbg_grav_sqrt = (double *) malloc(tend_size * sizeof(double));
+    dbg_grav_cos = (double *) malloc(tend_size * sizeof(double));
+    dbg_grav_wpert = (double *) malloc(tend_size * sizeof(double));
+    h_dbg_grav_square = (double *) malloc(tend_size * sizeof(double));
+    h_dbg_grav_sqrt = (double *) malloc(tend_size * sizeof(double));
+    h_dbg_grav_cos = (double *) malloc(tend_size * sizeof(double));
+    h_dbg_grav_wpert = (double *) malloc(tend_size * sizeof(double));
+
+
     // Define the maximum stable time step based on an assumed maximum wind speed
     dt = dmin(dx, dz) / max_speed * cfl;
     // Set initial elapsed model time and output_counter to zero
@@ -1311,9 +1583,27 @@ void device_init() {
     CUDA_CHECK(cudaMalloc((void **)&d_hy_dens_theta_int, (nz + 1) * sizeof(double)));
     CUDA_CHECK(cudaMalloc((void **)&d_hy_pressure_int, (nz + 1) * sizeof(double)));
 
-    // Grid spacing parameters
-    CUDA_CHECK(cudaMemcpyToSymbol(dx, &dx, sizeof(double)));
-    CUDA_CHECK(cudaMemcpyToSymbol(dz, &dz, sizeof(double)));
+    CUDA_CHECK(cudaMalloc((void **)&d_dbg_grav_square, tend_size * sizeof(double)));
+    CUDA_CHECK(cudaMalloc((void **)&d_dbg_grav_sqrt, tend_size * sizeof(double)));
+    CUDA_CHECK(cudaMalloc((void **)&d_dbg_grav_cos, tend_size * sizeof(double)));
+    CUDA_CHECK(cudaMalloc((void **)&d_dbg_grav_wpert, tend_size * sizeof(double)));
+
+    CUDA_CHECK(cudaMemcpyToSymbol(d_dbg_grav_square_ptr, &d_dbg_grav_square, sizeof(double*)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_dbg_grav_sqrt_ptr, &d_dbg_grav_sqrt, sizeof(double*)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_dbg_grav_cos_ptr, &d_dbg_grav_cos, sizeof(double*)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_dbg_grav_wpert_ptr, &d_dbg_grav_wpert, sizeof(double*)));
+
+    // Copy hydrostatic data to device
+    CUDA_CHECK(cudaMemcpy(d_hy_dens_cell, hy_dens_cell, (nz + 2 * hs) * sizeof(double),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_hy_dens_theta_cell, hy_dens_theta_cell,
+                          (nz + 2 * hs) * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_hy_dens_int, hy_dens_int, (nz + 1) * sizeof(double),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_hy_dens_theta_int, hy_dens_theta_int, (nz + 1) * sizeof(double),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_hy_pressure_int, hy_pressure_int, (nz + 1) * sizeof(double),
+                          cudaMemcpyHostToDevice));
 
     // Static values
     CUDA_CHECK(cudaMemcpyToSymbol(d_dt, &dt, sizeof(double)));
@@ -1329,38 +1619,16 @@ void device_init() {
 
 
     // Allocate device state arrays
-    CUDA_CHECK(
-        cudaMalloc((void **)&d_state, (nx + 2 * hs) * (nz + 2 * hs) * NUM_VARS * sizeof(double)));
-    CUDA_CHECK(cudaMalloc((void **)&d_state_tmp,
-                          (nx + 2 * hs) * (nz + 2 * hs) * NUM_VARS * sizeof(double)));
-    CUDA_CHECK(cudaMalloc((void **)&d_flux, (nx + 1) * (nz + 1) * NUM_VARS * sizeof(double)));
-    CUDA_CHECK(cudaMalloc((void **)&d_tend, nx * nz * NUM_VARS * sizeof(double)));
+    CUDA_CHECK(cudaMalloc((void **)&d_state, state_size * sizeof(double)));
+    CUDA_CHECK(cudaMalloc((void **)&d_state_tmp, state_size * sizeof(double)));
+    CUDA_CHECK(cudaMalloc((void **)&d_flux, flux_size * sizeof(double)));
+    CUDA_CHECK(cudaMalloc((void **)&d_tend, tend_size * sizeof(double)));
     
-    // Copy hydrostatic data to device
-    CUDA_CHECK(cudaMemcpy(d_hy_dens_cell, hy_dens_cell, (nz + 2 * hs) * sizeof(double),
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_hy_dens_theta_cell, hy_dens_theta_cell,
-                          (nz + 2 * hs) * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_hy_dens_int, hy_dens_int, (nz + 1) * sizeof(double),
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_hy_dens_theta_int, hy_dens_theta_int, (nz + 1) * sizeof(double),
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_hy_pressure_int, hy_pressure_int, (nz + 1) * sizeof(double),
-                          cudaMemcpyHostToDevice));
-                          
     // Copy initial state data to device
-    CUDA_CHECK(cudaMemcpy(d_state, state, state_size * sizeof(double),
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_state_tmp, state_tmp,
-                          state_size * sizeof(double),
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_flux, flux,
-                          flux_size * sizeof(double),
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_tend, tend,
-                          tend_size * sizeof(double),
-                          cudaMemcpyHostToDevice));
-    
+    CUDA_CHECK(cudaMemcpy(d_state, state, state_size * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_state_tmp, state_tmp, state_size * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_flux, flux, flux_size * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_tend, tend, tend_size * sizeof(double), cudaMemcpyHostToDevice));
 }
 
 // This test case is initially balanced but injects fast, cold air from the left boundary near
