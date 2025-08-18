@@ -1,4 +1,4 @@
-name: Build and Test All Cases
+name: Build, Test, and Simulate All Cases
 
 on:
   push:
@@ -48,14 +48,14 @@ jobs:
         path: c/build/
         retention-days: 1
 
-  test:
+  unit-tests:
     runs-on: self-hosted
-    timeout-minutes: 45
+    timeout-minutes: 15
     needs: build
     strategy:
       matrix:
         case: [collision, thermal, gravity, density_current, injection]
-      max-parallel: 2
+      max-parallel: 4
     
     steps:
     - uses: actions/checkout@v4
@@ -70,7 +70,7 @@ jobs:
       run: |
         chmod +x c/build/*
     
-    - name: Run basic tests for ${{ matrix.case }}
+    - name: Run unit tests for ${{ matrix.case }}
       run: |
         # Source environment setup if available
         if [ -f ~/env.sh ]; then
@@ -91,15 +91,42 @@ jobs:
         ls -la *_test 2>/dev/null || echo "No test executables found"
         
         # Run tests with verbose output
-        make test
-        
-        # Show the test log if available
-        if [ -f Testing/Temporary/LastTest.log ]; then
-          echo "=== Test Log ==="
-          cat Testing/Temporary/LastTest.log
+        if ! make test; then
+          echo "=== TESTS FAILED ==="
+          # Show the test log if available
+          if [ -f Testing/Temporary/LastTest.log ]; then
+            echo "=== Test Log ==="
+            cat Testing/Temporary/LastTest.log
+          fi
+          echo "Test failure detected - failing CI job"
+          exit 1
+        else
+          echo "=== ALL TESTS PASSED ==="
         fi
+
+  simulation:
+    runs-on: self-hosted
+    timeout-minutes: 45
+    needs: unit-tests
+    strategy:
+      matrix:
+        case: [collision, thermal, gravity, density_current, injection]
+      max-parallel: 2
     
-    - name: Run executables and generate outputs for ${{ matrix.case }}
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download build artifacts for ${{ matrix.case }}
+      uses: actions/download-artifact@v4
+      with:
+        name: build-artifacts-${{ matrix.case }}
+        path: c/build/
+    
+    - name: Restore executable permissions
+      run: |
+        chmod +x c/build/*
+    
+    - name: Run full simulation for ${{ matrix.case }}
       run: |
         # Source environment setup if available
         if [ -f ~/env.sh ]; then
@@ -172,7 +199,7 @@ jobs:
           cp ./cuda_${{ matrix.case }}.nc ../../
         fi
     
-    - name: Validate outputs for ${{ matrix.case }}
+    - name: Validate simulation outputs for ${{ matrix.case }}
       run: |
         # Source environment setup if available
         if [ -f ~/env.sh ]; then
