@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.0)
-project(miniWeather CXX)
+project(miniWeather CXX CUDA)
 
 enable_testing()
 
@@ -165,12 +165,12 @@ if (CMAKE_CUDA_COMPILER)
   set_target_properties(cuda PROPERTIES 
     # COMPILE_FLAGS "${EXE_DEFS} -g -G"
     COMPILE_FLAGS "${EXE_DEFS} -fmad=false -O3"
-    CUDA_ARCHITECTURES "70;75;80")
+    CUDA_ARCHITECTURES "80")
 
   add_executable(cuda_test miniWeather_mpi_cuda.cu)
   set_target_properties(cuda_test PROPERTIES 
     COMPILE_FLAGS "${TEST_DEFS} -fmad=false -O3"
-    CUDA_ARCHITECTURES "70;75;80")
+    CUDA_ARCHITECTURES "80")
 
   if (NOT ("${LDFLAGS}" STREQUAL "") )
     target_link_libraries(cuda      "${LDFLAGS}")

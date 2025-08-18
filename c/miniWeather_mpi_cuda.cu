@@ -7,6 +7,9 @@
 //
 //////////////////////////////////////////////////////////////////////////////////////////
 
+#include <cstdio>
+#include <cstdlib>
+#include <cuda_runtime.h>
 #include <stdlib.h>
 #include <math.h>
 #include <stdio.h>
@@ -61,8 +64,8 @@ int    constexpr nz_glob       = _NZ;            //Number of total cells in the 
 double constexpr sim_time      = _SIM_TIME;      //How many seconds to run the simulation
 double constexpr output_freq   = _OUT_FREQ;      //How frequently to output data to file (in seconds)
 int    constexpr data_spec_int = _DATA_SPEC;     //How to initialize the data
-double constexpr dx            = xlen / nx_glob; // grid spacing in the x-direction
-double constexpr dz            = zlen / nz_glob; // grid spacing in the x-direction
+__host__ __device__ double constexpr dx            = xlen / nx_glob; // grid spacing in the x-direction
+__host__ __device__ double constexpr dz            = zlen / nz_glob; // grid spacing in the x-direction
 ///////////////////////////////////////////////////////////////////////////////////////
 // END USER-CONFIGURABLE PARAMETERS
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -71,6 +74,9 @@ double constexpr dz            = zlen / nz_glob; // grid spacing in the x-direct
 // Variables that are initialized but remain static over the course of the simulation
 ///////////////////////////////////////////////////////////////////////////////////////
 double dt;                    //Model time step (seconds)
+int    state_size;            //Number of elements in state array
+int    flux_size;             //Number of elements in flux array
+int    tend_size;             //Number of elements in tend array
 int    nx, nz;                //Number of local grid cells in the x- and z- dimensions for this MPI task
 int    i_beg, k_beg;          //beginning index in the x- and z-directions for this MPI task
 int    nranks, myrank;        //Number of MPI ranks and my rank id
@@ -81,6 +87,25 @@ double *hy_dens_theta_cell;   //hydrostatic rho*t (vert cell avgs).     Dimensio
 double *hy_dens_int;          //hydrostatic density (vert cell interf). Dimensions: (1:nz+1)
 double *hy_dens_theta_int;    //hydrostatic rho*t (vert cell interf).   Dimensions: (1:nz+1)
 double *hy_pressure_int;      //hydrostatic press (vert cell interf).   Dimensions: (1:nz+1)
+
+
+///////////////////////////////////////////////////////////////////////////////////////
+// Device Variables that are initialized but remain static over the course of the simulation
+///////////////////////////////////////////////////////////////////////////////////////
+__constant__ int d_nx, d_nz;       //Number of local grid cells in the x- and z- dimensions for this MPI task
+__constant__ int d_i_beg, d_k_beg; //beginning index in the x- and z-directions for this MPI task            
+
+double *d_hy_dens_cell;         //hydrostatic density (vert cell avgs).   Dimensions: (1-hs:nz+hs)
+double *d_hy_dens_theta_cell;   //hydrostatic rho*t (vert cell avgs).     Dimensions: (1-hs:nz+hs)
+double *d_hy_dens_int;          //hydrostatic density (vert cell interf). Dimensions: (1:nz+1)
+double *d_hy_dens_theta_int;    //hydrostatic rho*t (vert cell interf).   Dimensions: (1:nz+1)
+double *d_hy_pressure_int;      //hydrostatic press (vert cell interf).   Dimensions: (1:nz+1)
+
+__constant__ double *d_hy_dens_cell_ptr;         //hydrostatic density (vert cell avgs).   Dimensions: (1-hs:nz+hs)
+__constant__ double *d_hy_dens_theta_cell_ptr;   //hydrostatic rho*t (vert cell avgs).     Dimensions: (1-hs:nz+hs)
+__constant__ double *d_hy_dens_int_ptr;          //hydrostatic density (vert cell interf). Dimensions: (1:nz+1)
+__constant__ double *d_hy_dens_theta_int_ptr;    //hydrostatic rho*t (vert cell interf).   Dimensions: (1:nz+1)
+__constant__ double *d_hy_pressure_int_ptr;      //hydrostatic press (vert cell interf).   Dimensions: (1:nz+1)
 
 ///////////////////////////////////////////////////////////////////////////////////////
 // Variables that are dynamics over the course of the simulation
@@ -101,12 +126,49 @@ int    direction_switch = 1;
 double mass0, te0;            //Initial domain totals for mass and total energy  
 double mass , te ;            //Domain totals for mass and total energy  
 
+///////////////////////////////////////////////////////////////////////////////////////
+// Device Variables that are dynamics over the course of the simulation
+///////////////////////////////////////////////////////////////////////////////////////
+double *d_state;                //Fluid state.             Dimensions: (1-hs:nx+hs,1-hs:nz+hs,NUM_VARS)
+double *d_state_tmp;            //Fluid state.             Dimensions: (1-hs:nx+hs,1-hs:nz+hs,NUM_VARS)
+double *d_flux;                 //Cell interface fluxes.   Dimensions: (nx+1,nz+1,NUM_VARS)
+double *d_tend;                 //Fluid state tendencies.  Dimensions: (nx,nz,NUM_VARS)
+double *d_sendbuf_l;            //Buffer to send data to the left MPI rank
+double *d_sendbuf_r;            //Buffer to send data to the right MPI rank
+double *d_recvbuf_l;            //Buffer to receive data from the left MPI rank
+double *d_recvbuf_r;            //Buffer to receive data from the right MPI rank
+double *dbg_state;              //Debug state for CPU vs GPU comparison
+double halo_err = 0;            //Accumulator for halo comparison errors
+
 //How is this not in the standard?!
 double dmin( double a , double b ) { if (a<b) {return a;} else {return b;} };
+
+// Error checking macro
+#define CUDA_CHECK(call)                                                    \
+  do {                                                                      \
+    cudaError_t err = call;                                                 \
+    if (err != cudaSuccess) {                                               \
+      fprintf(stderr, "CUDA error at %s:%d - %s\n", __FILE__, __LINE__,     \
+              cudaGetErrorString(err));                                     \
+      exit(EXIT_FAILURE);                                                   \
+    }                                                                       \
+  } while (0)
+
+// Kernel Error Checking Macro
+#define CUDA_CHECK_KERNEL() do {                                            \
+    cudaError_t err = cudaGetLastError();                                   \
+    if (err != cudaSuccess) {                                               \
+        printf("Kernel launch failed: %s\n", cudaGetErrorString(err));      \
+        cudaDeviceSynchronize();                                            \
+        exit(1);                                                            \
+    }                                                                       \
+    cudaDeviceSynchronize();                                                \
+} while(0)
 
 
 //Declaring the functions defined after "main"
 void   init                 ( int *argc , char ***argv );
+void   device_init          ( );
 void   finalize             ( );
 void   injection            ( double x , double z , double &r , double &u , double &w , double &t , double &hr , double &ht );
 void   density_current      ( double x , double z , double &r , double &u , double &w , double &t , double &hr , double &ht );
@@ -118,7 +180,7 @@ void   hydro_const_bvfreq   ( double z , double bv_freq0 , double &r , double &t
 double sample_ellipse_cosine( double x , double z , double amp , double x0 , double z0 , double xrad , double zrad );
 void   output               ( double *state , double etime );
 void   ncwrap               ( int ierr , int line );
-void   perform_timestep     ( double *state , double *state_tmp , double *flux , double *tend , double dt );
+void   perform_timestep     ( double *d_state , double *d_state_tmp , double *d_flux , double *d_tend , double dt );
 void   semi_discrete_step   ( double *state_init , double *state_forcing , double *state_out , double dt , int dir , double *flux , double *tend );
 void   compute_tendencies_x ( double *state , double *flux , double *tend , double dt);
 void   compute_tendencies_z ( double *state , double *flux , double *tend , double dt);
@@ -133,6 +195,7 @@ void   reductions           ( double &mass , double &te );
 int main(int argc, char **argv) {
 
   init( &argc , &argv );
+  device_init();
 
   //Initial reductions for mass, kinetic energy, and total energy
   reductions(mass0,te0);
@@ -148,7 +211,8 @@ int main(int argc, char **argv) {
     //If the time step leads to exceeding the simulation time, shorten it for the last step
     if (etime + dt > sim_time) { dt = sim_time - etime; }
     //Perform a single time step
-    perform_timestep(state,state_tmp,flux,tend,dt);
+    perform_timestep(d_state,d_state_tmp,d_flux,d_tend,dt);
+    CUDA_CHECK(cudaMemcpy(state, d_state, state_size*sizeof(double), cudaMemcpyDeviceToHost));
     //Inform the user
 #ifndef NO_INFORM
     if (mainproc) { printf( "Elapsed Time: %lf / %lf\n", etime , sim_time ); }
@@ -186,29 +250,81 @@ int main(int argc, char **argv) {
 // q*     = q[n] + dt/3 * rhs(q[n])
 // q**    = q[n] + dt/2 * rhs(q*  )
 // q[n+1] = q[n] + dt/1 * rhs(q** )
-void perform_timestep( double *state , double *state_tmp , double *flux , double *tend , double dt ) {
+void perform_timestep( double *d_state , double *d_state_tmp , double *d_flux , double *d_tend , double dt ) {
   if (direction_switch) {
     //x-direction first
-    semi_discrete_step( state , state     , state_tmp , dt / 3 , DIR_X , flux , tend );
-    semi_discrete_step( state , state_tmp , state_tmp , dt / 2 , DIR_X , flux , tend );
-    semi_discrete_step( state , state_tmp , state     , dt / 1 , DIR_X , flux , tend );
+    semi_discrete_step( d_state , d_state     , d_state_tmp , dt / 3 , DIR_X , d_flux , d_tend );
+    semi_discrete_step( d_state , d_state_tmp , d_state_tmp , dt / 2 , DIR_X , d_flux , d_tend );
+    semi_discrete_step( d_state , d_state_tmp , d_state     , dt / 1 , DIR_X , d_flux , d_tend );
     //z-direction second
-    semi_discrete_step( state , state     , state_tmp , dt / 3 , DIR_Z , flux , tend );
-    semi_discrete_step( state , state_tmp , state_tmp , dt / 2 , DIR_Z , flux , tend );
-    semi_discrete_step( state , state_tmp , state     , dt / 1 , DIR_Z , flux , tend );
+    semi_discrete_step( d_state , d_state     , d_state_tmp , dt / 3 , DIR_Z , d_flux , d_tend );
+    semi_discrete_step( d_state , d_state_tmp , d_state_tmp , dt / 2 , DIR_Z , d_flux , d_tend );
+    semi_discrete_step( d_state , d_state_tmp , d_state     , dt / 1 , DIR_Z , d_flux , d_tend );
   } else {
     //z-direction second
-    semi_discrete_step( state , state     , state_tmp , dt / 3 , DIR_Z , flux , tend );
-    semi_discrete_step( state , state_tmp , state_tmp , dt / 2 , DIR_Z , flux , tend );
-    semi_discrete_step( state , state_tmp , state     , dt / 1 , DIR_Z , flux , tend );
+    semi_discrete_step( d_state , d_state     , d_state_tmp , dt / 3 , DIR_Z , d_flux , d_tend );
+    semi_discrete_step( d_state , d_state_tmp , d_state_tmp , dt / 2 , DIR_Z , d_flux , d_tend );
+    semi_discrete_step( d_state , d_state_tmp , d_state     , dt / 1 , DIR_Z , d_flux , d_tend );
     //x-direction first
-    semi_discrete_step( state , state     , state_tmp , dt / 3 , DIR_X , flux , tend );
-    semi_discrete_step( state , state_tmp , state_tmp , dt / 2 , DIR_X , flux , tend );
-    semi_discrete_step( state , state_tmp , state     , dt / 1 , DIR_X , flux , tend );
+    semi_discrete_step( d_state , d_state     , d_state_tmp , dt / 3 , DIR_X , d_flux , d_tend );
+    semi_discrete_step( d_state , d_state_tmp , d_state_tmp , dt / 2 , DIR_X , d_flux , d_tend );
+    semi_discrete_step( d_state , d_state_tmp , d_state     , dt / 1 , DIR_X , d_flux , d_tend );
   }
   if (direction_switch) { direction_switch = 0; } else { direction_switch = 1; }
+
 }
 
+__global__ void compute_gravity_waves_discrete_step(double *state_init, double *state_out,
+                                                    double *d_tend) {
+  int i, k, ll, indw;
+  double x, z, wpert, dist, x0, z0, xrad, zrad, amp;
+
+  ll = blockIdx.z * blockDim.z + threadIdx.z;
+  k = blockIdx.y * blockDim.y + threadIdx.y;
+  i = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (i < d_nx && k < d_nz && ll < NUM_VARS) {
+    x = (d_i_beg + i + 0.5) * dx;
+    z = (d_k_beg + k + 0.5) * dz;
+    // Using sample_ellipse_cosine requires "acc routine" in OpenACC and "declare
+    // target" in OpenMP offload Neither of these are particularly well supported.
+    // So I'm manually inlining here wpert = sample_ellipse_cosine( x,z , 0.01 ,
+    // xlen/8,1000., 500.,500. );
+    {
+      x0   = xlen/8;
+      z0   = 1000;
+      xrad = 500;
+      zrad = 500;
+      amp  = 0.01;
+      // Compute distance from bubble center
+      dist = sqrt( ((x-x0)/xrad)*((x-x0)/xrad) + ((z-z0)/zrad)*((z-z0)/zrad) ) * pi / 2.;
+      //If the distance from bubble center is less than the radius, create a cos**2 profile
+      if (dist <= pi / 2.) {
+        wpert = amp * pow(cos(dist), 2.);
+      } else {
+        wpert = 0.;
+      }
+      indw = ID_WMOM*d_nz*d_nx + k*d_nx + i;
+      atomicAdd(&d_tend[indw], wpert * d_hy_dens_cell_ptr[hs + k]);
+    }
+  }
+}
+
+__global__ void compute_discrete_step(double *d_state_init, double *d_state_out, double *d_tend,
+                                      double dt) {
+  int i, k, ll, inds, indt;
+
+  ll = blockIdx.z * blockDim.z + threadIdx.z;
+  k = blockIdx.y * blockDim.y + threadIdx.y;
+  i = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (i < d_nx && k < d_nz && ll < NUM_VARS) {
+    inds = ll*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + i+hs;
+    indt = ll*d_nz*d_nx + k*d_nx + i;
+
+    d_state_out[inds] = d_state_init[inds] + dt * d_tend[indt];
+  }
+}
 
 //Perform a single semi-discretized step in time with the form:
 //state_out = state_init + dt * rhs(state_forcing)
@@ -228,94 +344,192 @@ void semi_discrete_step( double *state_init , double *state_forcing , double *st
     compute_tendencies_z(state_forcing,flux,tend,dt);
   }
 
-  //Apply the tendencies to the fluid state
-#pragma omp parallel for private(inds,indt,x,z,x0,z0,xrad,zrad,amp,dist,wpert,indw) collapse(3)
-  for (ll=0; ll<NUM_VARS; ll++) {
-    for (k=0; k<nz; k++) {
-      for (i=0; i<nx; i++) {
-        if (data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
-          x = (i_beg + i+0.5)*dx;
-          z = (k_beg + k+0.5)*dz;
-          // Using sample_ellipse_cosine requires "acc routine" in OpenACC and "declare target" in OpenMP offload
-          // Neither of these are particularly well supported. So I'm manually inlining here
-          // wpert = sample_ellipse_cosine( x,z , 0.01 , xlen/8,1000., 500.,500. );
-          {
-            x0   = xlen/8;
-            z0   = 1000;
-            xrad = 500;
-            zrad = 500;
-            amp  = 0.01;
-            //Compute distance from bubble center
-            dist = sqrt( ((x-x0)/xrad)*((x-x0)/xrad) + ((z-z0)/zrad)*((z-z0)/zrad) ) * pi / 2.;
-            //If the distance from bubble center is less than the radius, create a cos**2 profile
-            if (dist <= pi / 2.) {
-              wpert = amp * pow(cos(dist),2.);
-            } else {
-              wpert = 0.;
-            }
-          }
-          indw = ID_WMOM*nz*nx + k*nx + i;
-          tend[indw] += wpert*hy_dens_cell[hs+k];
-        }
-        inds = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
-        indt = ll*nz*nx + k*nx + i;
-        state_out[inds] = state_init[inds] + dt * tend[indt];
-      }
+  dim3 block_dim(192, 1, 1);
+  dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, nz, NUM_VARS);
+  if (data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
+    compute_gravity_waves_discrete_step<<<grid_dim, block_dim>>>(state_init, state_out, tend);
+  }
+  compute_discrete_step<<<grid_dim, block_dim>>>(state_init, state_out, tend, dt);
+}
+
+__global__ void compute_tendencies_x_kernel( double *d_state, double *d_flux, double *d_tend, double dt ) {
+  int i, k, ll, s, inds;
+  int indt, indf1, indf2;
+  // x index in global position
+  i = blockIdx.x * (blockDim.x - sten_size) + threadIdx.x;
+  // z index in global position
+  k = blockIdx.y * blockDim.y + threadIdx.y;
+
+  extern __shared__ double sdata[];
+
+  int shared_size = blockDim.x * blockDim.y;
+
+  // if (i < d_nx + 2*hs && k < d_nz + 2*hs) {
+    for (ll = 0; ll < NUM_VARS; ll++) {
+      int common_offset = ll * shared_size;
+      int shared_idx = common_offset + threadIdx.y * blockDim.x + threadIdx.x;
+      int global_idx = ll * (d_nx + 2 * hs) * (d_nz + 2 * hs) + (k + hs) * (d_nx + 2 * hs) + i;
+      sdata[shared_idx] = d_state[global_idx];
     }
+  // }
+  __syncthreads();
+
+  if (i < d_nx + 1 && k < d_nz && threadIdx.x < blockDim.x - sten_size + 1) {
+    volatile double r, u, w, t, p, stencil[4], d3_vals[NUM_VARS], vals[NUM_VARS], hv_coef;
+    // Compute the hyperviscosity coefficient
+    hv_coef = -hv_beta * dx / (16 * dt);
+
+    // Use fourth-order interpolation from four cell averages to compute the value at
+    // the interface in question
+    for (ll = 0; ll < NUM_VARS; ll++) {
+      for (s = 0; s < sten_size; s++) {
+        int common_offset = ll * shared_size;
+        int shared_idx = common_offset + threadIdx.y * blockDim.x + threadIdx.x + s;
+        stencil[s] = sdata[shared_idx];
+      }
+      // Fourth-order-accurate interpolation of the state
+      vals[ll] =
+        -stencil[0] / 12 + 7 * stencil[1] / 12 + 7 * stencil[2] / 12 - stencil[3] / 12;
+      // First-order-accurate interpolation of the third spatial derivative of the
+      // state (for artificial viscosity)
+      d3_vals[ll] = -stencil[0] + 3 * stencil[1] - 3 * stencil[2] + stencil[3];
+    }
+
+    // Compute density, u-wind, w-wind, potential temperature, and pressure (r,u,w,t,p
+    // respectively)
+    r = vals[ID_DENS] + d_hy_dens_cell_ptr[k + hs];
+    u = vals[ID_UMOM] / r;
+    w = vals[ID_WMOM] / r;
+    t = (vals[ID_RHOT] + d_hy_dens_theta_cell_ptr[k + hs]) / r;
+    p = C0 * pow((r * t), gamm);
+
+    // Compute the flux vector
+    d_flux[ID_DENS * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
+      r * u - hv_coef * d3_vals[ID_DENS];
+    d_flux[ID_UMOM * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
+      r * u * u + p - hv_coef * d3_vals[ID_UMOM];
+    d_flux[ID_WMOM * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
+      r * u * w - hv_coef * d3_vals[ID_WMOM];
+    d_flux[ID_RHOT * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
+      r * u * t - hv_coef * d3_vals[ID_RHOT];
   }
 }
 
+__global__ void update_tendencies_x_kernel(double *d_flux, double *d_tend) {
+  int i, k, ll, indf1, indf2, indt;
+
+  ll = blockIdx.z * blockDim.z + threadIdx.z;
+  k = blockIdx.y * blockDim.y + threadIdx.y;
+  i = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (ll < NUM_VARS && k < d_nz && i < d_nx) {
+    indt = ll * d_nz * d_nx + k * d_nx + i;
+    indf1 = ll * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i;
+    indf2 = ll * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i + 1;
+    d_tend[indt] = -(d_flux[indf2] - d_flux[indf1]) / dx;
+  }
+}
 
 //Compute the time tendencies of the fluid state using forcing in the x-direction
 //Since the halos are set in a separate routine, this will not require MPI
 //First, compute the flux vector at each cell interface in the x-direction (including hyperviscosity)
 //Then, compute the tendencies using those fluxes
 void compute_tendencies_x( double *state , double *flux , double *tend , double dt ) {
-  int    i,k,ll,s,inds,indf1,indf2,indt;
-  double r,u,w,t,p, stencil[4], d3_vals[NUM_VARS], vals[NUM_VARS], hv_coef;
-  //Compute the hyperviscosity coefficient
-  hv_coef = -hv_beta * dx / (16*dt);
-  //Compute fluxes in the x-direction for each cell
-#pragma omp parallel for private(inds,stencil,vals,d3_vals,r,u,w,t,p,ll,s) collapse(2)
-  for (k=0; k<nz; k++) {
-    for (i=0; i<nx+1; i++) {
-      //Use fourth-order interpolation from four cell averages to compute the value at the interface in question
-      for (ll=0; ll<NUM_VARS; ll++) {
-        for (s=0; s < sten_size; s++) {
-          inds = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+s;
-          stencil[s] = state[inds];
-        }
-        //Fourth-order-accurate interpolation of the state
-        vals[ll] = -stencil[0]/12 + 7*stencil[1]/12 + 7*stencil[2]/12 - stencil[3]/12;
-        //First-order-accurate interpolation of the third spatial derivative of the state (for artificial viscosity)
-        d3_vals[ll] = -stencil[0] + 3*stencil[1] - 3*stencil[2] + stencil[3];
-      }
+  dim3 block_dim(128, 1, 1);
+  dim3 grid_dim((nx + 1 + (block_dim.x - sten_size)) / (block_dim.x - sten_size + 1),
+                (nz + block_dim.y - 1) / block_dim.y, 1);
 
-      //Compute density, u-wind, w-wind, potential temperature, and pressure (r,u,w,t,p respectively)
-      r = vals[ID_DENS] + hy_dens_cell[k+hs];
-      u = vals[ID_UMOM] / r;
-      w = vals[ID_WMOM] / r;
-      t = ( vals[ID_RHOT] + hy_dens_theta_cell[k+hs] ) / r;
-      p = C0*pow((r*t),gamm);
+  int shared_width = block_dim.x;
+  int shared_height = block_dim.y;
+  int shared_memory_size = NUM_VARS * shared_width * shared_height * sizeof(double);
+  compute_tendencies_x_kernel<<<grid_dim, block_dim, shared_memory_size>>>( state, flux, tend, dt);
+  CUDA_CHECK_KERNEL();
 
-      //Compute the flux vector
-      flux[ID_DENS*(nz+1)*(nx+1) + k*(nx+1) + i] = r*u     - hv_coef*d3_vals[ID_DENS];
-      flux[ID_UMOM*(nz+1)*(nx+1) + k*(nx+1) + i] = r*u*u+p - hv_coef*d3_vals[ID_UMOM];
-      flux[ID_WMOM*(nz+1)*(nx+1) + k*(nx+1) + i] = r*u*w   - hv_coef*d3_vals[ID_WMOM];
-      flux[ID_RHOT*(nz+1)*(nx+1) + k*(nx+1) + i] = r*u*t   - hv_coef*d3_vals[ID_RHOT];
+  block_dim = dim3(192, 1, 1);
+  grid_dim = dim3((nx + block_dim.x - 1) / block_dim.x, (nz + block_dim.y - 1) / block_dim.y,
+                  NUM_VARS);
+  update_tendencies_x_kernel<<<grid_dim, block_dim>>>(flux, tend);
+  CUDA_CHECK_KERNEL();
+}
+
+
+__global__ void compute_tendencies_z_kernel( double *d_state, double *d_flux, double *d_tend, double dt) {
+  extern __shared__ double sdata[];
+
+  int i, k, ll, s, inds;
+  int indt, indf1, indf2;
+  i = blockIdx.x * blockDim.x + threadIdx.x;
+  k = blockIdx.y * (blockDim.y - sten_size) + threadIdx.y;
+
+  int shared_size = blockDim.x * blockDim.y;
+
+  // NOTE: I'm transposing the data so that later access would be faster.
+  // if (i < d_nx + 2 * hs && k < d_nz + 2 * hs) {
+    for (ll = 0; ll < NUM_VARS; ll++) {
+      int common_offset = ll * shared_size;
+      int shared_idx = common_offset + threadIdx.y * blockDim.x + threadIdx.x;
+      int global_idx = ll * (d_nz + 2 * hs) * (d_nx + 2 * hs) + k * (d_nx + 2 * hs) + i + hs;
+      sdata[shared_idx] = d_state[global_idx];
     }
-  }
+  // }
+  __syncthreads();
 
-  //Use the fluxes to compute tendencies for each cell
-#pragma omp parallel for private(indt,indf1,indf2) collapse(3)
-  for (ll=0; ll<NUM_VARS; ll++) {
-    for (k=0; k<nz; k++) {
-      for (i=0; i<nx; i++) {
-        indt  = ll* nz   * nx    + k* nx    + i  ;
-        indf1 = ll*(nz+1)*(nx+1) + k*(nx+1) + i  ;
-        indf2 = ll*(nz+1)*(nx+1) + k*(nx+1) + i+1;
-        tend[indt] = -( flux[indf2] - flux[indf1] ) / dx;
+  if (i < d_nx && k < d_nz + 1 && threadIdx.y < blockDim.y - sten_size + 1) {
+    volatile double r, u, w, t, p, stencil[4], d3_vals[NUM_VARS], vals[NUM_VARS], hv_coef;
+
+    hv_coef = -hv_beta * dz / (16*dt);
+
+    // Use fourth-order interpolation from four cell averages to compute the value at
+    // the interface in question
+    for (ll=0; ll<NUM_VARS; ll++) {
+      for (s=0; s<sten_size; s++) {
+        int common_offset = ll * shared_size;
+        int shared_idx = common_offset + (threadIdx.y+s) * blockDim.x + threadIdx.x;
+        stencil[s] = sdata[shared_idx];
       }
+      // Fourth-order-accurate interpolation of the state
+      vals[ll] = -stencil[0]/12 + 7*stencil[1]/12 + 7*stencil[2]/12 - stencil[3]/12;
+      // First-order-accurate interpolation of the third spatial derivative of the state
+      d3_vals[ll] = -stencil[0] + 3*stencil[1] - 3*stencil[2] + stencil[3];
+    }
+
+    // Compute density, u-wind, w-wind, potential temperature, and pressure (r,u,w,t,p respectively)
+    r = vals[ID_DENS] + d_hy_dens_int_ptr[k];
+    u = vals[ID_UMOM] / r;
+    w = vals[ID_WMOM] / r;
+    t = (vals[ID_RHOT] + d_hy_dens_theta_int_ptr[k]) / r;
+    p = C0 * pow((r * t), gamm) - d_hy_pressure_int_ptr[k];
+    // Enforce vertical boundary condition and exact mass conservation
+    if (k == 0 || k == d_nz) {
+        w                = 0;
+        d3_vals[ID_DENS] = 0;
+    }
+
+    // Compute the flux vector with hyperviscosity
+    d_flux[ID_DENS*(d_nz+1)*(d_nx+1) + k*(d_nx+1) + i] = r*w     - hv_coef*d3_vals[ID_DENS];
+    d_flux[ID_UMOM*(d_nz+1)*(d_nx+1) + k*(d_nx+1) + i] = r*w*u   - hv_coef*d3_vals[ID_UMOM];
+    d_flux[ID_WMOM*(d_nz+1)*(d_nx+1) + k*(d_nx+1) + i] = r*w*w+p - hv_coef*d3_vals[ID_WMOM];
+    d_flux[ID_RHOT*(d_nz+1)*(d_nx+1) + k*(d_nx+1) + i] = r*w*t   - hv_coef*d3_vals[ID_RHOT];
+  }
+}
+
+
+__global__ void update_tendencies_z_kernel(double *d_state, double *d_flux, double *d_tend) {
+  int i, k, ll, inds, indf1, indf2, indt;
+
+  i = blockIdx.x * blockDim.x + threadIdx.x;
+  k = blockIdx.y * blockDim.y + threadIdx.y;
+  ll = blockIdx.z * blockDim.z + threadIdx.z;
+
+  if (ll < NUM_VARS && k < d_nz && i < d_nx) {
+    indt = ll * d_nz * d_nx + k * d_nx + i;
+    indf1 = ll * (d_nz + 1) * (d_nx + 1) + (k) * (d_nx + 1) + i;
+    indf2 = ll * (d_nz + 1) * (d_nx + 1) + (k + 1) * (d_nx + 1) + i;
+    d_tend[indt] = -(d_flux[indf2] - d_flux[indf1]) / dz;
+    if (ll == ID_WMOM) {
+      inds =
+        ID_DENS * (d_nz + 2 * hs) * (d_nx + 2 * hs) + (k + hs) * (d_nx + 2 * hs) + i + hs;
+      d_tend[indt] = d_tend[indt] - d_state[inds] * grav;
     }
   }
 }
@@ -326,64 +540,69 @@ void compute_tendencies_x( double *state , double *flux , double *tend , double 
 //First, compute the flux vector at each cell interface in the z-direction (including hyperviscosity)
 //Then, compute the tendencies using those fluxes
 void compute_tendencies_z( double *state , double *flux , double *tend , double dt ) {
-  int    i,k,ll,s, inds, indf1, indf2, indt;
-  double r,u,w,t,p, stencil[4], d3_vals[NUM_VARS], vals[NUM_VARS], hv_coef;
-  //Compute the hyperviscosity coefficient
-  hv_coef = -hv_beta * dz / (16*dt);
-  //Compute fluxes in the x-direction for each cell
-#pragma omp parallel for private(inds,stencil,vals,d3_vals,r,u,w,t,p,ll,s) collapse(2)
-  for (k=0; k<nz+1; k++) {
-    for (i=0; i<nx; i++) {
-      //Use fourth-order interpolation from four cell averages to compute the value at the interface in question
-      for (ll=0; ll<NUM_VARS; ll++) {
-        for (s=0; s<sten_size; s++) {
-          inds = ll*(nz+2*hs)*(nx+2*hs) + (k+s)*(nx+2*hs) + i+hs;
-          stencil[s] = state[inds];
-        }
-        //Fourth-order-accurate interpolation of the state
-        vals[ll] = -stencil[0]/12 + 7*stencil[1]/12 + 7*stencil[2]/12 - stencil[3]/12;
-        //First-order-accurate interpolation of the third spatial derivative of the state
-        d3_vals[ll] = -stencil[0] + 3*stencil[1] - 3*stencil[2] + stencil[3];
-      }
+  dim3 block_dim(4, 128, 1);
+  dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x,
+                (nz + 1 + block_dim.y - sten_size - 1) / (block_dim.y - sten_size), 1);
 
-      //Compute density, u-wind, w-wind, potential temperature, and pressure (r,u,w,t,p respectively)
-      r = vals[ID_DENS] + hy_dens_int[k];
-      u = vals[ID_UMOM] / r;
-      w = vals[ID_WMOM] / r;
-      t = ( vals[ID_RHOT] + hy_dens_theta_int[k] ) / r;
-      p = C0*pow((r*t),gamm) - hy_pressure_int[k];
-      //Enforce vertical boundary condition and exact mass conservation
-      if (k == 0 || k == nz) {
-        w                = 0;
-        d3_vals[ID_DENS] = 0;
-      }
+  int shared_width = block_dim.x;
+  int shared_height = block_dim.y;
+  int shared_memory_size = NUM_VARS * shared_width * shared_height * sizeof(double);
 
-      //Compute the flux vector with hyperviscosity
-      flux[ID_DENS*(nz+1)*(nx+1) + k*(nx+1) + i] = r*w     - hv_coef*d3_vals[ID_DENS];
-      flux[ID_UMOM*(nz+1)*(nx+1) + k*(nx+1) + i] = r*w*u   - hv_coef*d3_vals[ID_UMOM];
-      flux[ID_WMOM*(nz+1)*(nx+1) + k*(nx+1) + i] = r*w*w+p - hv_coef*d3_vals[ID_WMOM];
-      flux[ID_RHOT*(nz+1)*(nx+1) + k*(nx+1) + i] = r*w*t   - hv_coef*d3_vals[ID_RHOT];
-    }
+  compute_tendencies_z_kernel<<<grid_dim, block_dim, shared_memory_size>>>( state, flux, tend, dt);
+  CUDA_CHECK_KERNEL();
+
+  block_dim = dim3(192, 1, 1);
+  grid_dim = dim3((nx + block_dim.x - 1) / block_dim.x, (nz + block_dim.y - 1) / block_dim.y,
+                NUM_VARS);
+  update_tendencies_z_kernel<<<grid_dim, block_dim>>>(state, flux, tend);
+  CUDA_CHECK_KERNEL();
+}
+
+__global__ void set_halo_values_x_kernel( double *d_state ) {
+  int k, ll;
+  k = blockIdx.x * blockDim.x + threadIdx.x;
+  ll = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (k < d_nz && ll < NUM_VARS) {
+    d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + 0        ] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + d_nx+hs-2];
+    d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + 1        ] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + d_nx+hs-1];
+    d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + d_nx+hs  ] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + hs     ];
+    d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + d_nx+hs+1] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + hs+1   ];
   }
+}
 
-  //Use the fluxes to compute tendencies for each cell
-#pragma omp parallel for private(indt,indf1,indf2,inds) collapse(3)
-  for (ll=0; ll<NUM_VARS; ll++) {
-    for (k=0; k<nz; k++) {
-      for (i=0; i<nx; i++) {
-        indt  = ll* nz   * nx    + k* nx    + i  ;
-        indf1 = ll*(nz+1)*(nx+1) + (k  )*(nx+1) + i;
-        indf2 = ll*(nz+1)*(nx+1) + (k+1)*(nx+1) + i;
-        tend[indt] = -( flux[indf2] - flux[indf1] ) / dz;
-        if (ll == ID_WMOM) {
-          inds = ID_DENS*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
-          tend[indt] = tend[indt] - state[inds]*grav;
-        }
-      }
+__global__ void data_spec_injection_kernel(double *d_state) {
+  int i, k, ll;
+  int ind_r, ind_u, ind_t;
+  double z;
+
+  k = blockIdx.x * blockDim.x + threadIdx.x;
+  i = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (i < hs && k < d_nz) {
+    z = (d_k_beg + k+0.5)*dz;
+
+    if (fabs(z-3*zlen/4) <= zlen/16) {
+      ind_r = ID_DENS*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + i;
+      ind_u = ID_UMOM*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + i;
+      ind_t = ID_RHOT*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + i;
+      d_state[ind_u] = (d_state[ind_r]+d_hy_dens_cell_ptr[k+hs]) * 50.;
+      d_state[ind_t] = (d_state[ind_r]+d_hy_dens_cell_ptr[k+hs]) * 298. - d_hy_dens_theta_cell_ptr[k+hs];
     }
   }
 }
 
+// void set_halo_values_x_cpu(double *state) {
+//   int k, ll;
+//   for (ll=0; ll<NUM_VARS; ll++) {
+//     for (k=0; k<nz; k++) {
+//       state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + 0      ] = state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + nx+hs-2];
+//       state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + 1      ] = state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + nx+hs-1];
+//       state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + nx+hs  ] = state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + hs     ];
+//       state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + nx+hs+1] = state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + hs+1   ];
+//     }
+//   }
+// }
 
 //Set this MPI task's halo values in the x-direction. This routine will require MPI
 void set_halo_values_x( double *state ) {
@@ -391,19 +610,46 @@ void set_halo_values_x( double *state ) {
   double z;
 
   if (nranks == 1) {
-
-#pragma omp parallel for collapse(2)
-    for (ll=0; ll<NUM_VARS; ll++) {
-      for (k=0; k<nz; k++) {
-        state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + 0      ] = state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + nx+hs-2];
-        state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + 1      ] = state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + nx+hs-1];
-        state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + nx+hs  ] = state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + hs     ];
-        state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + nx+hs+1] = state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + hs+1   ];
+    // Copy GPU state to host for CPU computation
+    CUDA_CHECK(cudaMemcpy(dbg_state, state, state_size * sizeof(double), cudaMemcpyDeviceToHost));
+    
+    // Compute CPU result on copy
+    set_halo_values_x_cpu(dbg_state);
+    
+    // Compute GPU result
+    dim3 block_dim(1024, 1, 1);
+    dim3 grid_dim((nz + block_dim.x - 1) / block_dim.x, NUM_VARS, 1);
+    set_halo_values_x_kernel<<<grid_dim, block_dim>>>(state);
+    CUDA_CHECK_KERNEL();
+    
+    // Copy GPU result back to host for comparison
+    double *gpu_result = (double *) malloc(state_size * sizeof(double));
+    CUDA_CHECK(cudaMemcpy(gpu_result, state, state_size * sizeof(double), cudaMemcpyDeviceToHost));
+    
+    // Compare results for halo regions only
+    for (int ll = 0; ll < NUM_VARS; ll++) {
+      for (int k = 0; k < nz; k++) {
+        for (int i = 0; i < nx + 2 * hs; i++) {
+          if (i < hs || i >= nx + hs) { // Only check halo regions
+            int idx = ll * (nx + 2 * hs) * (nz + 2 * hs) + (k + hs) * (nx + 2 * hs) + i;
+            double cpu_val = dbg_state[idx];
+            double gpu_val = gpu_result[idx];
+            if (cpu_val != gpu_val) {
+              halo_err += fabs(cpu_val - gpu_val);
+              printf("Halo mismatch at ll=%d, k=%d, i=%d: CPU=%.17le, GPU=%.17le\n", 
+                     ll, k, i, cpu_val, gpu_val);
+            }
+          }
+        }
       }
     }
+    
+    free(gpu_result);
 
   } else {
-
+    // TODO: Port this to CUDA
+    printf("NOT IMPLEMENTED YET");
+    exit(1);
     MPI_Request req_r[2], req_s[2];
 
     //Prepost receives
@@ -445,19 +691,34 @@ void set_halo_values_x( double *state ) {
 
   if (data_spec_int == DATA_SPEC_INJECTION) {
     if (myrank == 0) {
-#pragma omp parallel for private(z,ind_r,ind_u,ind_t) collapse(2)
-      for (k=0; k<nz; k++) {
-        for (i=0; i<hs; i++) {
-          z = (k_beg + k+0.5)*dz;
-          if (fabs(z-3*zlen/4) <= zlen/16) {
-            ind_r = ID_DENS*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i;
-            ind_u = ID_UMOM*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i;
-            ind_t = ID_RHOT*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i;
-            state[ind_u] = (state[ind_r]+hy_dens_cell[k+hs]) * 50.;
-            state[ind_t] = (state[ind_r]+hy_dens_cell[k+hs]) * 298. - hy_dens_theta_cell[k+hs];
-          }
-        }
-      }
+      dim3 blockDim(192, 1, 1);
+      dim3 gridDim((nz + blockDim.x - 1) / blockDim.x, (hs + blockDim.y) / blockDim.y, 1);
+      data_spec_injection_kernel<<<gridDim, blockDim>>>(state);
+    }
+  }
+}
+
+__global__ void set_halo_values_z_kernel(double *d_state) {
+  int ll, i;
+  i = blockDim.x * blockIdx.x + threadIdx.x;
+  ll = blockDim.y * blockIdx.y + threadIdx.y;
+
+  if (i < d_nx + 2 * hs && ll < NUM_VARS) {
+    if (ll == ID_WMOM) {
+      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (0        )*(d_nx+2*hs) + i] = 0.;
+      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (1        )*(d_nx+2*hs) + i] = 0.;
+      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs  )*(d_nx+2*hs) + i] = 0.;
+      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs+1)*(d_nx+2*hs) + i] = 0.;
+    } else if (ll == ID_UMOM) {
+      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (0        )*(d_nx+2*hs) + i] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (hs       )*(d_nx+2*hs) + i] / d_hy_dens_cell_ptr[hs       ] * d_hy_dens_cell_ptr[0        ];
+      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (1        )*(d_nx+2*hs) + i] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (hs       )*(d_nx+2*hs) + i] / d_hy_dens_cell_ptr[hs       ] * d_hy_dens_cell_ptr[1        ];
+      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs  )*(d_nx+2*hs) + i] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs-1)*(d_nx+2*hs) + i] / d_hy_dens_cell_ptr[d_nz+hs-1] * d_hy_dens_cell_ptr[d_nz+hs  ];
+      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs+1)*(d_nx+2*hs) + i] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs-1)*(d_nx+2*hs) + i] / d_hy_dens_cell_ptr[d_nz+hs-1] * d_hy_dens_cell_ptr[d_nz+hs+1];
+    } else {
+      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (0        )*(d_nx+2*hs) + i] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (hs       )*(d_nx+2*hs) + i];
+      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (1        )*(d_nx+2*hs) + i] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (hs       )*(d_nx+2*hs) + i];
+      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs  )*(d_nx+2*hs) + i] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs-1)*(d_nx+2*hs) + i];
+      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs+1)*(d_nx+2*hs) + i] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs-1)*(d_nx+2*hs) + i];
     }
   }
 }
@@ -466,28 +727,11 @@ void set_halo_values_x( double *state ) {
 //Set this MPI task's halo values in the z-direction. This does not require MPI because there is no MPI
 //decomposition in the vertical direction
 void set_halo_values_z( double *state ) {
-  int          i, ll;
-#pragma omp parallel for collapse(2)
-  for (ll=0; ll<NUM_VARS; ll++) {
-    for (i=0; i<nx+2*hs; i++) {
-      if (ll == ID_WMOM) {
-        state[ll*(nz+2*hs)*(nx+2*hs) + (0      )*(nx+2*hs) + i] = 0.;
-        state[ll*(nz+2*hs)*(nx+2*hs) + (1      )*(nx+2*hs) + i] = 0.;
-        state[ll*(nz+2*hs)*(nx+2*hs) + (nz+hs  )*(nx+2*hs) + i] = 0.;
-        state[ll*(nz+2*hs)*(nx+2*hs) + (nz+hs+1)*(nx+2*hs) + i] = 0.;
-      } else if (ll == ID_UMOM) {
-        state[ll*(nz+2*hs)*(nx+2*hs) + (0      )*(nx+2*hs) + i] = state[ll*(nz+2*hs)*(nx+2*hs) + (hs     )*(nx+2*hs) + i] / hy_dens_cell[hs     ] * hy_dens_cell[0      ];
-        state[ll*(nz+2*hs)*(nx+2*hs) + (1      )*(nx+2*hs) + i] = state[ll*(nz+2*hs)*(nx+2*hs) + (hs     )*(nx+2*hs) + i] / hy_dens_cell[hs     ] * hy_dens_cell[1      ];
-        state[ll*(nz+2*hs)*(nx+2*hs) + (nz+hs  )*(nx+2*hs) + i] = state[ll*(nz+2*hs)*(nx+2*hs) + (nz+hs-1)*(nx+2*hs) + i] / hy_dens_cell[nz+hs-1] * hy_dens_cell[nz+hs  ];
-        state[ll*(nz+2*hs)*(nx+2*hs) + (nz+hs+1)*(nx+2*hs) + i] = state[ll*(nz+2*hs)*(nx+2*hs) + (nz+hs-1)*(nx+2*hs) + i] / hy_dens_cell[nz+hs-1] * hy_dens_cell[nz+hs+1];
-      } else {
-        state[ll*(nz+2*hs)*(nx+2*hs) + (0      )*(nx+2*hs) + i] = state[ll*(nz+2*hs)*(nx+2*hs) + (hs     )*(nx+2*hs) + i];
-        state[ll*(nz+2*hs)*(nx+2*hs) + (1      )*(nx+2*hs) + i] = state[ll*(nz+2*hs)*(nx+2*hs) + (hs     )*(nx+2*hs) + i];
-        state[ll*(nz+2*hs)*(nx+2*hs) + (nz+hs  )*(nx+2*hs) + i] = state[ll*(nz+2*hs)*(nx+2*hs) + (nz+hs-1)*(nx+2*hs) + i];
-        state[ll*(nz+2*hs)*(nx+2*hs) + (nz+hs+1)*(nx+2*hs) + i] = state[ll*(nz+2*hs)*(nx+2*hs) + (nz+hs-1)*(nx+2*hs) + i];
-      }
-    }
-  }
+  dim3 block_dim(192, 1, 1);
+  dim3 grid_dim((nx + 2 * hs + block_dim.x - 1) / block_dim.x, NUM_VARS, 1);
+
+  set_halo_values_z_kernel<<<grid_dim, block_dim>>>(state);
+  CUDA_CHECK_KERNEL();
 }
 
 
@@ -520,11 +764,16 @@ void init( int *argc , char ***argv ) {
   nz = nz_glob;
   mainproc = (myrank == 0);
 
+  //Initialize array sizes
+  state_size = (nx+2*hs)*(nz+2*hs)*NUM_VARS;
+  flux_size  = (nx+1)*(nz+1)*NUM_VARS;
+  tend_size  = nx*nz*NUM_VARS;
+
   //Allocate the model data
-  state              = (double *) malloc( (nx+2*hs)*(nz+2*hs)*NUM_VARS*sizeof(double) );
-  state_tmp          = (double *) malloc( (nx+2*hs)*(nz+2*hs)*NUM_VARS*sizeof(double) );
-  flux               = (double *) malloc( (nx+1)*(nz+1)*NUM_VARS*sizeof(double) );
-  tend               = (double *) malloc( nx*nz*NUM_VARS*sizeof(double) );
+  state              = (double *) malloc( state_size*sizeof(double) );
+  state_tmp          = (double *) malloc( state_size*sizeof(double) );
+  flux               = (double *) malloc( flux_size *sizeof(double) );
+  tend               = (double *) malloc( tend_size *sizeof(double) );
   hy_dens_cell       = (double *) malloc( (nz+2*hs)*sizeof(double) );
   hy_dens_theta_cell = (double *) malloc( (nz+2*hs)*sizeof(double) );
   hy_dens_int        = (double *) malloc( (nz+1)*sizeof(double) );
@@ -534,6 +783,7 @@ void init( int *argc , char ***argv ) {
   sendbuf_r          = (double *) malloc( hs*nz*NUM_VARS*sizeof(double) );
   recvbuf_l          = (double *) malloc( hs*nz*NUM_VARS*sizeof(double) );
   recvbuf_r          = (double *) malloc( hs*nz*NUM_VARS*sizeof(double) );
+  dbg_state          = (double *) malloc( state_size*sizeof(double) );
 
   //Define the maximum stable time step based on an assumed maximum wind speed
   dt = dmin(dx,dz) / max_speed * cfl;
@@ -622,6 +872,60 @@ void init( int *argc , char ***argv ) {
     hy_dens_theta_int[k] = hr*ht;
     hy_pressure_int  [k] = C0*pow((hr*ht),gamm);
   }
+}
+
+void device_init() {
+
+  //Malloc Device state
+  CUDA_CHECK(cudaMalloc((void**)&d_state, state_size * sizeof(double)));
+  CUDA_CHECK(cudaMalloc((void**)&d_state_tmp, state_size * sizeof(double)));
+  CUDA_CHECK(cudaMalloc((void**)&d_flux, flux_size * sizeof(double)));
+  CUDA_CHECK(cudaMalloc((void**)&d_tend, tend_size * sizeof(double)));
+
+  //Copy initialized host data to device
+  CUDA_CHECK(cudaMemcpy(d_state, state, state_size * sizeof(double), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_state_tmp, state_tmp, state_size * sizeof(double), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_flux, flux, flux_size * sizeof(double), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_tend, tend, tend_size * sizeof(double), cudaMemcpyHostToDevice));
+
+  //Allocate hydrostatic array
+  int hy_dens_cell_size       = (nz+2*hs);
+  int hy_dens_theta_cell_size = (nz+2*hs);
+  int hy_dens_int_size        = (nz+1);
+  int hy_dens_theta_int_size  = (nz+1);
+  int hy_pressure_int_size    = (nz+1);
+  CUDA_CHECK(cudaMalloc((void**)&d_hy_dens_cell,       hy_dens_cell_size *sizeof(double) ));
+  CUDA_CHECK(cudaMalloc((void**)&d_hy_dens_theta_cell, hy_dens_theta_cell_size * sizeof(double) ));
+  CUDA_CHECK(cudaMalloc((void**)&d_hy_dens_int,        hy_dens_int_size * sizeof(double)));
+  CUDA_CHECK(cudaMalloc((void**)&d_hy_dens_theta_int,  hy_dens_theta_int_size * sizeof(double)));
+  CUDA_CHECK(cudaMalloc((void**)&d_hy_pressure_int,    hy_pressure_int_size * sizeof(double) ));
+
+  //Copy hydrostatic array
+  CUDA_CHECK(cudaMemcpy(d_hy_dens_cell,       hy_dens_cell,       hy_dens_cell_size*sizeof(double), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_hy_dens_theta_cell, hy_dens_theta_cell, hy_dens_theta_cell_size*sizeof(double), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_hy_dens_int,        hy_dens_int,        hy_dens_int_size*sizeof(double), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_hy_dens_theta_int,  hy_dens_theta_int,  hy_dens_theta_int_size*sizeof(double), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_hy_pressure_int,      hy_pressure_int,    hy_pressure_int_size*sizeof(double), cudaMemcpyHostToDevice));
+
+  //Copy pointer to constant device memory
+  CUDA_CHECK(cudaMemcpyToSymbol(d_hy_dens_cell_ptr,       &d_hy_dens_cell,      sizeof(double*)));
+  CUDA_CHECK(cudaMemcpyToSymbol(d_hy_dens_theta_cell_ptr, &d_hy_dens_theta_cell,sizeof(double*)));
+  CUDA_CHECK(cudaMemcpyToSymbol(d_hy_dens_int_ptr,        &d_hy_dens_int,       sizeof(double*)));
+  CUDA_CHECK(cudaMemcpyToSymbol(d_hy_dens_theta_int_ptr,  &d_hy_dens_theta_int, sizeof(double*)));
+  CUDA_CHECK(cudaMemcpyToSymbol(d_hy_pressure_int_ptr,    &d_hy_pressure_int,   sizeof(double*)));
+
+  //Allocate device buffer for MPI
+  int buffer_size = hs*nz*NUM_VARS;
+  CUDA_CHECK(cudaMalloc((void**)&d_sendbuf_l, buffer_size * sizeof(double)));
+  CUDA_CHECK(cudaMalloc((void**)&d_sendbuf_r, buffer_size * sizeof(double)));
+  CUDA_CHECK(cudaMalloc((void**)&d_recvbuf_l, buffer_size * sizeof(double)));
+  CUDA_CHECK(cudaMalloc((void**)&d_recvbuf_r, buffer_size * sizeof(double)));
+
+  //Copy values for static device variables
+  CUDA_CHECK(cudaMemcpyToSymbol(d_nx, &nx, sizeof(int)));
+  CUDA_CHECK(cudaMemcpyToSymbol(d_nz, &nz, sizeof(int)));
+  CUDA_CHECK(cudaMemcpyToSymbol(d_i_beg, &i_beg, sizeof(int)));
+  CUDA_CHECK(cudaMemcpyToSymbol(d_k_beg, &k_beg, sizeof(int)));
 }
 
 
@@ -864,12 +1168,14 @@ void finalize() {
   free( sendbuf_r );
   free( recvbuf_l );
   free( recvbuf_r );
+  free( dbg_state );
   ierr = MPI_Finalize();
 }
 
 
 //Compute reduced quantities for error checking without resorting to the "ncdiff" tool
 void reductions( double &mass , double &te ) {
+  CUDA_CHECK(cudaMemcpy(state, d_state, state_size*sizeof(double), cudaMemcpyDeviceToHost));
   double mass_loc = 0;
   double te_loc   = 0;
   #pragma omp parallel for reduction(+:mass_loc,te_loc)
