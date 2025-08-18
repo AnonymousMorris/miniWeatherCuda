@@ -1,4 +1,4 @@
-name: Build
+name: Build and Test All Cases
 
 on:
   push:
@@ -9,41 +9,47 @@ on:
 jobs:
   build:
     runs-on: self-hosted
+    strategy:
+      matrix:
+        case: [collision, thermal, gravity, density_current, injection]
     
     steps:
     - uses: actions/checkout@v4
     
-    - name: Build project
+    - name: Build ${{ matrix.case }} case
       run: |
         cd c/build
-        bash -c "source ./cmake_andes_gnu_cpu.sh"
+        bash -c "source ./my_cmake_scripts/cmake_andes_gnu_cpu_${{ matrix.case }}.sh"
         make
     
-    - name: Upload build artifacts
+    - name: Upload build artifacts for ${{ matrix.case }}
       uses: actions/upload-artifact@v4
       with:
-        name: build-artifacts
+        name: build-artifacts-${{ matrix.case }}
         path: c/build/
         retention-days: 1
 
   test:
     runs-on: self-hosted
     needs: build
+    strategy:
+      matrix:
+        case: [collision, thermal, gravity, density_current, injection]
     
     steps:
     - uses: actions/checkout@v4
     
-    - name: Download build artifacts
+    - name: Download build artifacts for ${{ matrix.case }}
       uses: actions/download-artifact@v4
       with:
-        name: build-artifacts
+        name: build-artifacts-${{ matrix.case }}
         path: c/build/
     
     - name: Restore executable permissions
       run: |
         chmod +x c/build/*
     
-    - name: Run tests
+    - name: Run tests for ${{ matrix.case }}
       run: |
         cd c/build
         make test

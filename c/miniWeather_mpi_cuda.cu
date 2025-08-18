@@ -137,8 +137,6 @@ double *d_sendbuf_l;            //Buffer to send data to the left MPI rank
 double *d_sendbuf_r;            //Buffer to send data to the right MPI rank
 double *d_recvbuf_l;            //Buffer to receive data from the left MPI rank
 double *d_recvbuf_r;            //Buffer to receive data from the right MPI rank
-double *dbg_state;              //Debug state for CPU vs GPU comparison
-double halo_err = 0;            //Accumulator for halo comparison errors
 
 //How is this not in the standard?!
 double dmin( double a , double b ) { if (a<b) {return a;} else {return b;} };
@@ -592,17 +590,6 @@ __global__ void data_spec_injection_kernel(double *d_state) {
   }
 }
 
-// void set_halo_values_x_cpu(double *state) {
-//   int k, ll;
-//   for (ll=0; ll<NUM_VARS; ll++) {
-//     for (k=0; k<nz; k++) {
-//       state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + 0      ] = state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + nx+hs-2];
-//       state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + 1      ] = state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + nx+hs-1];
-//       state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + nx+hs  ] = state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + hs     ];
-//       state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + nx+hs+1] = state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + hs+1   ];
-//     }
-//   }
-// }
 
 //Set this MPI task's halo values in the x-direction. This routine will require MPI
 void set_halo_values_x( double *state ) {
@@ -610,42 +597,10 @@ void set_halo_values_x( double *state ) {
   double z;
 
   if (nranks == 1) {
-    // Copy GPU state to host for CPU computation
-    CUDA_CHECK(cudaMemcpy(dbg_state, state, state_size * sizeof(double), cudaMemcpyDeviceToHost));
-    
-    // Compute CPU result on copy
-    set_halo_values_x_cpu(dbg_state);
-    
-    // Compute GPU result
     dim3 block_dim(1024, 1, 1);
     dim3 grid_dim((nz + block_dim.x - 1) / block_dim.x, NUM_VARS, 1);
     set_halo_values_x_kernel<<<grid_dim, block_dim>>>(state);
     CUDA_CHECK_KERNEL();
-    
-    // Copy GPU result back to host for comparison
-    double *gpu_result = (double *) malloc(state_size * sizeof(double));
-    CUDA_CHECK(cudaMemcpy(gpu_result, state, state_size * sizeof(double), cudaMemcpyDeviceToHost));
-    
-    // Compare results for halo regions only
-    for (int ll = 0; ll < NUM_VARS; ll++) {
-      for (int k = 0; k < nz; k++) {
-        for (int i = 0; i < nx + 2 * hs; i++) {
-          if (i < hs || i >= nx + hs) { // Only check halo regions
-            int idx = ll * (nx + 2 * hs) * (nz + 2 * hs) + (k + hs) * (nx + 2 * hs) + i;
-            double cpu_val = dbg_state[idx];
-            double gpu_val = gpu_result[idx];
-            if (cpu_val != gpu_val) {
-              halo_err += fabs(cpu_val - gpu_val);
-              printf("Halo mismatch at ll=%d, k=%d, i=%d: CPU=%.17le, GPU=%.17le\n", 
-                     ll, k, i, cpu_val, gpu_val);
-            }
-          }
-        }
-      }
-    }
-    
-    free(gpu_result);
-
   } else {
     // TODO: Port this to CUDA
     printf("NOT IMPLEMENTED YET");
@@ -783,7 +738,6 @@ void init( int *argc , char ***argv ) {
   sendbuf_r          = (double *) malloc( hs*nz*NUM_VARS*sizeof(double) );
   recvbuf_l          = (double *) malloc( hs*nz*NUM_VARS*sizeof(double) );
   recvbuf_r          = (double *) malloc( hs*nz*NUM_VARS*sizeof(double) );
-  dbg_state          = (double *) malloc( state_size*sizeof(double) );
 
   //Define the maximum stable time step based on an assumed maximum wind speed
   dt = dmin(dx,dz) / max_speed * cfl;
@@ -1168,7 +1122,6 @@ void finalize() {
   free( sendbuf_r );
   free( recvbuf_l );
   free( recvbuf_r );
-  free( dbg_state );
   ierr = MPI_Finalize();
 }
 
