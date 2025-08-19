@@ -18,3 +18,12 @@ cmake -DCMAKE_CXX_COMPILER=mpic++                                               
       -DDATA_SPEC="DATA_SPEC_DENSITY_CURRENT"                                         \
       -DSIM_TIME=1000                                                                 \
       ..
+
+# Compile with multi-threading
+if [ $? -eq 0 ]; then
+    echo "CMake configuration successful, starting multi-threaded compilation..."
+    make -j$(nproc)
+else
+    echo "CMake configuration failed"
+    exit 1
+fi

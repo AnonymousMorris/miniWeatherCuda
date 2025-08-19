@@ -112,6 +112,9 @@ jobs:
       matrix:
         case: [collision, thermal, gravity, density_current, injection]
       max-parallel: 2
+      fail-fast: false
+    env:
+      WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
     
     steps:
     - uses: actions/checkout@v4
@@ -126,6 +129,18 @@ jobs:
       run: |
         chmod +x c/build/*
     
+    - name: Cache Python dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-wandb
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install Python dependencies
+      run: |
+        pip3 install wandb
+    
     - name: Run full simulation for ${{ matrix.case }}
       run: |
         # Source environment setup if available
@@ -134,70 +149,58 @@ jobs:
         fi
         cd c/build/case_results/${{ matrix.case }}
         
-        # Set shorter timeout for CI runs
-        timeout_cmd="timeout 300"  # 5 minute timeout per executable
-        
-        echo "Running serial executable..."
+        # Collect available executables for benchmarking
+        executables=()
         if [ -f "./serial_${{ matrix.case }}" ]; then
-          if $timeout_cmd ./serial_${{ matrix.case }}; then
-            if [ -f "./output.nc" ]; then
-              mv ./output.nc ./serial_${{ matrix.case }}.nc
-              echo "Serial output saved as serial_${{ matrix.case }}.nc"
-            else
-              echo "Warning: serial did not produce output.nc"
-            fi
-          else
-            echo "Warning: serial execution timed out or failed"
-          fi
-        else
-          echo "Warning: serial_${{ matrix.case }} executable not found"
+          executables+=("serial_${{ matrix.case }}")
         fi
-        
-        echo "Running OpenACC executable..."
         if [ -f "./openacc_${{ matrix.case }}" ]; then
-          if $timeout_cmd ./openacc_${{ matrix.case }}; then
-            if [ -f "./output.nc" ]; then
-              mv ./output.nc ./openacc_${{ matrix.case }}.nc
-              echo "OpenACC output saved as openacc_${{ matrix.case }}.nc"
-            else
-              echo "Warning: openacc did not produce output.nc"
-            fi
-          else
-            echo "Warning: openacc execution timed out or failed"
-          fi
-        else
-          echo "Warning: openacc_${{ matrix.case }} executable not found"
+          executables+=("openacc_${{ matrix.case }}")
+        fi
+        if [ -f "./cuda_${{ matrix.case }}" ]; then
+          executables+=("cuda_${{ matrix.case }}")
         fi
         
-        echo "Running CUDA executable..."
-        if [ -f "./cuda_${{ matrix.case }}" ]; then
-          if $timeout_cmd ./cuda_${{ matrix.case }}; then
-            if [ -f "./output.nc" ]; then
-              mv ./output.nc ./cuda_${{ matrix.case }}.nc
-              echo "CUDA output saved as cuda_${{ matrix.case }}.nc"
-            else
-              echo "Warning: cuda did not produce output.nc"
-            fi
-          else
-            echo "Warning: cuda execution timed out or failed"
-          fi
-        else
-          echo "Warning: cuda_${{ matrix.case }} executable not found"
+        if [ ${#executables[@]} -eq 0 ]; then
+          echo "Warning: No executables found for ${{ matrix.case }}"
+          exit 1
         fi
+        
+        echo "Found executables: ${executables[*]}"
+        
+        # Ensure executables have execute permissions
+        for exe in "${executables[@]}"; do
+          chmod +x "./${exe}"
+        done
+        
+        # Run benchmarking script with timing and W&B logging
+        python3 ../../bench_simulation.py --case ${{ matrix.case }} "${executables[@]}"
         
         echo "Listing generated NetCDF files:"
         ls -la *.nc || echo "No NetCDF files found"
         
-        # Move outputs back to main build directory for validation and artifact collection
-        if [ -f "./serial_${{ matrix.case }}.nc" ]; then
-          cp ./serial_${{ matrix.case }}.nc ../../
-        fi
-        if [ -f "./openacc_${{ matrix.case }}.nc" ]; then
-          cp ./openacc_${{ matrix.case }}.nc ../../
-        fi
-        if [ -f "./cuda_${{ matrix.case }}.nc" ]; then
-          cp ./cuda_${{ matrix.case }}.nc ../../
-        fi
+        # The bench_simulation.py script creates files like serial_collision.nc
+        # We need to copy them to the build directory for validation and artifacts
+        for exe in "${executables[@]}"; do
+          if [ -f "./${exe}.nc" ]; then
+            cp "./${exe}.nc" ../../
+            echo "Copied ${exe}.nc to build directory"
+          else
+            echo "Warning: ${exe}.nc not found after benchmarking"
+          fi
+        done
+    
+    - name: Cache Python dependencies for validation
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-netcdf4
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install Python dependencies for validation
+      run: |
+        pip3 install netCDF4
     
     - name: Validate simulation outputs for ${{ matrix.case }}
       run: |
@@ -230,7 +233,7 @@ jobs:
         # Run validation if we have all three outputs
         if [ "$HAS_SERIAL" = true ] && [ "$HAS_OPENACC" = true ] && [ "$HAS_CUDA" = true ]; then
           echo "Running 3-way validation..."
-          python validate_netcdf.py serial_${{ matrix.case }}.nc openacc_${{ matrix.case }}.nc cuda_${{ matrix.case }}.nc
+          python3 validate_netcdf.py serial_${{ matrix.case }}.nc openacc_${{ matrix.case }}.nc cuda_${{ matrix.case }}.nc
           echo "Validation completed for ${{ matrix.case }} case"
         else
           echo "Skipping validation - not all three outputs available"

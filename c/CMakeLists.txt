@@ -3,6 +3,13 @@ project(miniWeather CXX)
 
 enable_language(CUDA)
 
+# Enable parallel compilation
+include(ProcessorCount)
+ProcessorCount(N)
+if(NOT N EQUAL 0)
+  set(CMAKE_BUILD_PARALLEL_LEVEL ${N})
+endif()
+
 enable_testing()
 
 include(utils.cmake)
