@@ -154,6 +154,9 @@ jobs:
         if [ -f "./serial_${{ matrix.case }}" ]; then
           executables+=("serial_${{ matrix.case }}")
         fi
+        if [ -f "./openmp_${{ matrix.case }}" ]; then
+          executables+=("openmp_${{ matrix.case }}")
+        fi
         if [ -f "./openacc_${{ matrix.case }}" ]; then
           executables+=("openacc_${{ matrix.case }}")
         fi

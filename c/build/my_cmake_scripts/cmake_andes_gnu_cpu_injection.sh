@@ -13,8 +13,8 @@ cmake -DCMAKE_CXX_COMPILER=mpic++                                               
       -DOPENACC_FLAGS="-acc"                                                     \
       -DCUDA_FLAGS="-arch=sm_83 -lcudart"                                             \
       -DCUDA_LINK_FLAGS="-lcudart -lmpi"                                              \
-      -DNX=200                                                                        \
-      -DNZ=100                                                                        \
+      -DNX=400                                                                        \
+      -DNZ=200                                                                        \
       -DDATA_SPEC="DATA_SPEC_INJECTION"                                               \
       -DSIM_TIME=1000                                                                 \
       ..
