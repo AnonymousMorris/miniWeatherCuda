@@ -647,7 +647,7 @@ void set_halo_values_x( double *state ) {
   if (data_spec_int == DATA_SPEC_INJECTION) {
     if (myrank == 0) {
       dim3 blockDim(192, 1, 1);
-      dim3 gridDim((nz + blockDim.x - 1) / blockDim.x, (hs + blockDim.y) / blockDim.y, 1);
+      dim3 gridDim((nz + blockDim.x - 1) / blockDim.x, hs, 1);
       data_spec_injection_kernel<<<gridDim, blockDim>>>(state);
     }
   }
