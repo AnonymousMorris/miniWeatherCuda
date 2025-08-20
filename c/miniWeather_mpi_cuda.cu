@@ -1009,6 +1009,14 @@ void output( double *state , double etime ) {
   //Temporary arrays to hold density, u-wind, w-wind, and potential temperature (theta)
   double *dens, *uwnd, *wwnd, *theta;
   double *etimearr;
+  CUDA_CHECK(cudaMemcpy(state, d_state, (nx + 2 * hs) * (nz + 2 * hs) * NUM_VARS * sizeof(double),
+                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaDeviceSynchronize());
+  // Update host data from device (equivalent to #pragma acc update host)
+  // CUDA_CHECK(cudaMemcpyAsync(state, d_state,
+  //                            (nx + 2 * hs) * (nz + 2 * hs) * NUM_VARS * sizeof(double),
+  //                            cudaMemcpyDeviceToHost, 0));
+  // CUDA_CHECK(cudaStreamSynchronize(0));
   //Inform the user
   if (mainproc) { printf("*** OUTPUT ***\n"); }
   //Allocate some (big) temp arrays
