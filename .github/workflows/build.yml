@@ -236,7 +236,7 @@ jobs:
         # Run validation if we have all three outputs
         if [ "$HAS_SERIAL" = true ] && [ "$HAS_OPENACC" = true ] && [ "$HAS_CUDA" = true ]; then
           echo "Running 3-way validation..."
-          python3 validate_netcdf.py serial_${{ matrix.case }}.nc openacc_${{ matrix.case }}.nc cuda_${{ matrix.case }}.nc
+          python3 validate_netcdf.py openacc_${{ matrix.case }}.nc serial_${{ matrix.case }}.nc cuda_${{ matrix.case }}.nc
           echo "Validation completed for ${{ matrix.case }} case"
         else
           echo "Skipping validation - not all three outputs available"
