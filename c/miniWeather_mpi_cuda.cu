@@ -1009,9 +1009,7 @@ void output( double *state , double etime ) {
   //Temporary arrays to hold density, u-wind, w-wind, and potential temperature (theta)
   double *dens, *uwnd, *wwnd, *theta;
   double *etimearr;
-  CUDA_CHECK(cudaMemcpy(state, d_state, (nx + 2 * hs) * (nz + 2 * hs) * NUM_VARS * sizeof(double),
-                        cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaMemcpy(state, d_state, state_size * sizeof(double), cudaMemcpyDeviceToHost));
   // Update host data from device (equivalent to #pragma acc update host)
   // CUDA_CHECK(cudaMemcpyAsync(state, d_state,
   //                            (nx + 2 * hs) * (nz + 2 * hs) * NUM_VARS * sizeof(double),
@@ -1133,36 +1131,133 @@ void finalize() {
   ierr = MPI_Finalize();
 }
 
+__global__ void reductions_kernel(double *d_state, double *mass_result, double *te_result) {
+  extern __shared__ double sdata[];
 
-//Compute reduced quantities for error checking without resorting to the "ncdiff" tool
-void reductions( double &mass , double &te ) {
-  CUDA_CHECK(cudaMemcpy(state, d_state, state_size*sizeof(double), cudaMemcpyDeviceToHost));
-  double mass_loc = 0;
-  double te_loc   = 0;
-  #pragma omp parallel for reduction(+:mass_loc,te_loc)
-  for (int k=0; k<nz; k++) {
-    for (int i=0; i<nx; i++) {
-      int ind_r = ID_DENS*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
-      int ind_u = ID_UMOM*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
-      int ind_w = ID_WMOM*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
-      int ind_t = ID_RHOT*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
-      double r  =   state[ind_r] + hy_dens_cell[hs+k];             // Density
-      double u  =   state[ind_u] / r;                              // U-wind
-      double w  =   state[ind_w] / r;                              // W-wind
-      double th = ( state[ind_t] + hy_dens_theta_cell[hs+k] ) / r; // Potential Temperature (theta)
-      double p  = C0*pow(r*th,gamm);                               // Pressure
-      double t  = th / pow(p0/p,rd/cp);                            // Temperature
-      double ke = r*(u*u+w*w);                                     // Kinetic Energy
-      double ie = r*cv*t;                                          // Internal Energy
-      mass_loc += r        *dx*dz; // Accumulate domain mass
-      te_loc   += (ke + ie)*dx*dz; // Accumulate domain total energy
-    }
+  int tid = threadIdx.x + threadIdx.y * blockDim.x;
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int k = blockIdx.y * blockDim.y + threadIdx.y;
+  int block_size = blockDim.x * blockDim.y;
+
+  // Initialize shared memory
+  double mass = 0.0;
+  double te = 0.0;
+
+  if (i < d_nx && k < d_nz) {
+    int ind_r =
+      ID_DENS * (d_nz + 2 * hs) * (d_nx + 2 * hs) + (k + hs) * (d_nx + 2 * hs) + i + hs;
+    int ind_u =
+      ID_UMOM * (d_nz + 2 * hs) * (d_nx + 2 * hs) + (k + hs) * (d_nx + 2 * hs) + i + hs;
+    int ind_w =
+      ID_WMOM * (d_nz + 2 * hs) * (d_nx + 2 * hs) + (k + hs) * (d_nx + 2 * hs) + i + hs;
+    int ind_t =
+      ID_RHOT * (d_nz + 2 * hs) * (d_nx + 2 * hs) + (k + hs) * (d_nx + 2 * hs) + i + hs;
+
+    double r = d_state[ind_r] + d_hy_dens_cell_ptr[hs + k];
+    double u = d_state[ind_u] / r;
+    double w = d_state[ind_w] / r;
+    double th = (d_state[ind_t] + d_hy_dens_theta_cell_ptr[hs + k]) / r;
+    double p = C0 * pow(r * th, gamm);
+    double t = th / pow(p0 / p, rd / cp);
+    double ke = r * (u * u + w * w);
+    double ie = r * cv * t;
+    mass = r * dx * dz;
+    te = (ke + ie) * dx * dz;
   }
-  double glob[2], loc[2];
-  loc[0] = mass_loc;
-  loc[1] = te_loc;
-  int ierr = MPI_Allreduce(loc,glob,2,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
-  mass = glob[0];
-  te   = glob[1];
+
+  // Store in shared memory (mass values in first half, te values in second half)
+  sdata[tid] = mass;
+  sdata[tid + block_size] = te;
+  __syncthreads();
+
+  // Block-level reduction using shared memory
+  for (int s = block_size / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      sdata[tid] += sdata[tid + s];
+      sdata[tid + block_size] += sdata[tid + s + block_size];
+    }
+    __syncthreads();
+  }
+
+  // Only thread 0 of each block writes to global memory
+  if (tid == 0) {
+    atomicAdd(mass_result, sdata[0]);
+    atomicAdd(te_result, sdata[block_size]);
+  }
 }
 
+__host__ void reductions_host(double &mass, double &te) {
+  dim3 block_dim(256, 1, 1);
+  dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, (nz + block_dim.y - 1) / block_dim.y, 1);
+
+  double *mass_result, *te_result;
+  CUDA_CHECK(cudaMallocManaged((void **)&mass_result, sizeof(double), cudaMemAttachGlobal));
+  CUDA_CHECK(cudaMallocManaged((void **)&te_result, sizeof(double), cudaMemAttachGlobal));
+
+  *mass_result = 0.0;
+  *te_result = 0.0;
+
+  // Calculate shared memory size: 2 * block_size * sizeof(double) for mass and te arrays
+  int block_size = block_dim.x * block_dim.y;
+  int shared_mem_size = 2 * block_size * sizeof(double);
+
+  reductions_kernel<<<grid_dim, block_dim, shared_mem_size>>>(
+    d_state, mass_result, te_result);
+
+  CUDA_CHECK_KERNEL();
+
+
+  mass = *mass_result;
+  te = *te_result;
+
+  CUDA_CHECK(cudaFree(mass_result));
+  CUDA_CHECK(cudaFree(te_result));
+}
+
+// Compute reduced quantities for error checking without resorting to the "ncdiff" tool
+void reductions(double &mass, double &te) {
+    mass = 0;
+    te = 0;
+
+    reductions_host(mass, te);
+    double glob[2], loc[2];
+    loc[0] = mass;
+    loc[1] = te;
+    int ierr = MPI_Allreduce(loc, glob, 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    mass = glob[0];
+    te = glob[1];
+}
+
+//
+// //Compute reduced quantities for error checking without resorting to the "ncdiff" tool
+// void reductions( double &mass , double &te ) {
+//   CUDA_CHECK(cudaMemcpy(state, d_state, state_size*sizeof(double), cudaMemcpyDeviceToHost));
+//   double mass_loc = 0;
+//   double te_loc   = 0;
+//   #pragma omp parallel for reduction(+:mass_loc,te_loc)
+//   for (int k=0; k<nz; k++) {
+//     for (int i=0; i<nx; i++) {
+//       int ind_r = ID_DENS*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
+//       int ind_u = ID_UMOM*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
+//       int ind_w = ID_WMOM*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
+//       int ind_t = ID_RHOT*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
+//       double r  =   state[ind_r] + hy_dens_cell[hs+k];             // Density
+//       double u  =   state[ind_u] / r;                              // U-wind
+//       double w  =   state[ind_w] / r;                              // W-wind
+//       double th = ( state[ind_t] + hy_dens_theta_cell[hs+k] ) / r; // Potential Temperature (theta)
+//       double p  = C0*pow(r*th,gamm);                               // Pressure
+//       double t  = th / pow(p0/p,rd/cp);                            // Temperature
+//       double ke = r*(u*u+w*w);                                     // Kinetic Energy
+//       double ie = r*cv*t;                                          // Internal Energy
+//       mass_loc += r        *dx*dz; // Accumulate domain mass
+//       te_loc   += (ke + ie)*dx*dz; // Accumulate domain total energy
+//     }
+//   }
+//   double glob[2], loc[2];
+//   loc[0] = mass_loc;
+//   loc[1] = te_loc;
+//   int ierr = MPI_Allreduce(loc,glob,2,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
+//   mass = glob[0];
+//   te   = glob[1];
+// }
+//
