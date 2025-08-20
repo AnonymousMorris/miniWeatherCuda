@@ -350,6 +350,62 @@ void semi_discrete_step( double *state_init , double *state_forcing , double *st
   compute_discrete_step<<<grid_dim, block_dim>>>(state_init, state_out, tend, dt);
 }
 
+__global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux, double *d_tend, double dt ) {
+    int i, k, ll, s, inds;
+    i = blockIdx.x * blockDim.x + threadIdx.x;
+    k = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i < d_nx + 1 && k < d_nz) {
+        double r, u, w, t, p, stencil[4], d3_vals[NUM_VARS], vals[NUM_VARS], hv_coef;
+        // Compute the hyperviscosity coefficient
+        hv_coef = -hv_beta * dx / (16 * dt);
+
+        // Use fourth-order interpolation from four cell averages to compute the value at
+        // the interface in question
+        for (ll = 0; ll < NUM_VARS; ll++) {
+            for (s = 0; s < sten_size; s++) {
+                inds = ll * (d_nz + 2 * hs) * (d_nx + 2 * hs) + (k + hs) * (d_nx + 2 * hs) + i + s;
+                stencil[s] = d_state[inds];
+            }
+            // Fourth-order-accurate interpolation of the state
+            vals[ll] =
+                -stencil[0] / 12 + 7 * stencil[1] / 12 + 7 * stencil[2] / 12 - stencil[3] / 12;
+            // First-order-accurate interpolation of the third spatial derivative of the
+            // state (for artificial viscosity)
+            d3_vals[ll] = -stencil[0] + 3 * stencil[1] - 3 * stencil[2] + stencil[3];
+        }
+
+        // Compute density, u-wind, w-wind, potential temperature, and pressure (r,u,w,t,p
+        // respectively)
+        r = vals[ID_DENS] + d_hy_dens_cell_ptr[k + hs];
+        u = vals[ID_UMOM] / r;
+        w = vals[ID_WMOM] / r;
+        t = (vals[ID_RHOT] + d_hy_dens_theta_cell_ptr[k + hs]) / r;
+        p = C0 * pow((r * t), gamm);
+
+        // Compute the flux vector
+        d_flux[ID_DENS * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
+            r * u - hv_coef * d3_vals[ID_DENS];
+        d_flux[ID_UMOM * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
+            r * u * u + p - hv_coef * d3_vals[ID_UMOM];
+        d_flux[ID_WMOM * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
+            r * u * w - hv_coef * d3_vals[ID_WMOM];
+        d_flux[ID_RHOT * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
+            r * u * t - hv_coef * d3_vals[ID_RHOT];
+    }
+}
+__host__ void compute_tendecies_x_flux_host(double *d_state, double *d_flux, double *d_tend,
+                                            double dt) {
+  dim3 block_dim(512, 1, 1);
+  dim3 grid_dim((nx + 1 + block_dim.x - 1) / block_dim.x, (nz + block_dim.y - 1) / block_dim.y,
+                1);
+
+  compute_tendencies_x_flux_kernel<<<grid_dim, block_dim>>>(
+    d_state, d_flux, d_tend, dt);
+
+  CUDA_CHECK_KERNEL();
+}
+
 __global__ void compute_tendencies_x_kernel( double *d_state, double *d_flux, double *d_tend, double dt ) {
   int i, k, ll, s, inds;
   int indt, indf1, indf2;
@@ -440,8 +496,11 @@ void compute_tendencies_x( double *state , double *flux , double *tend , double 
   int shared_width = block_dim.x;
   int shared_height = block_dim.y;
   int shared_memory_size = NUM_VARS * shared_width * shared_height * sizeof(double);
-  compute_tendencies_x_kernel<<<grid_dim, block_dim, shared_memory_size>>>( state, flux, tend, dt);
-  CUDA_CHECK_KERNEL();
+  // compute_tendencies_x_kernel<<<grid_dim, block_dim, shared_memory_size>>>( state, flux, tend, dt);
+  // CUDA_CHECK_KERNEL();
+
+  //TODO: change this back later
+  compute_tendecies_x_flux_host(state, flux, tend, dt);
 
   block_dim = dim3(192, 1, 1);
   grid_dim = dim3((nx + block_dim.x - 1) / block_dim.x, (nz + block_dim.y - 1) / block_dim.y,
@@ -451,6 +510,65 @@ void compute_tendencies_x( double *state , double *flux , double *tend , double 
 }
 
 
+__global__ void compute_tendencies_z_flux_kernel(double *d_state, double *d_flux, double *d_tend, double dt) {
+    int i, k, ll, s, inds;
+    i = blockIdx.x * blockDim.x + threadIdx.x;
+    k = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i < d_nx && k < d_nz + 1) {
+        volatile double r, u, w, t, p, stencil[4], d3_vals[NUM_VARS], vals[NUM_VARS], hv_coef;
+
+        hv_coef = -hv_beta * dz / (16 * dt);
+
+        // Use fourth-order interpolation from four cell averages to compute the value at
+        // the interface in question
+        for (ll = 0; ll < NUM_VARS; ll++) {
+            for (s = 0; s < sten_size; s++) {
+                inds = ll * (d_nz + 2 * hs) * (d_nx + 2 * hs) + (k + s) * (d_nx + 2 * hs) + i + hs;
+                stencil[s] = d_state[inds];
+            }
+            // Fourth-order-accurate interpolation of the state
+            vals[ll] =
+                -stencil[0] / 12 + 7 * stencil[1] / 12 + 7 * stencil[2] / 12 - stencil[3] / 12;
+            // First-order-accurate interpolation of the third spatial derivative of the
+            // state
+            d3_vals[ll] = -stencil[0] + 3 * stencil[1] - 3 * stencil[2] + stencil[3];
+        }
+
+        // Compute density, u-wind, w-wind, potential temperature, and pressure (r,u,w,t,p
+        // respectively)
+        r = vals[ID_DENS] + d_hy_dens_int_ptr[k];
+        u = vals[ID_UMOM] / r;
+        w = vals[ID_WMOM] / r;
+        t = (vals[ID_RHOT] + d_hy_dens_theta_int_ptr[k]) / r;
+        p = C0 * pow((r * t), gamm) - d_hy_pressure_int_ptr[k];
+        // Enforce vertical boundary condition and exact mass conservation
+        if (k == 0 || k == d_nz) {
+            w = 0;
+            d3_vals[ID_DENS] = 0;
+        }
+
+        // Compute the flux vector with hyperviscosity
+        d_flux[ID_DENS * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
+            r * w - hv_coef * d3_vals[ID_DENS];
+        d_flux[ID_UMOM * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
+            r * w * u - hv_coef * d3_vals[ID_UMOM];
+        d_flux[ID_WMOM * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
+            r * w * w + p - hv_coef * d3_vals[ID_WMOM];
+        d_flux[ID_RHOT * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
+            r * w * t - hv_coef * d3_vals[ID_RHOT];
+    }
+}
+__host__ void compute_tendecies_z_flux_host(double *d_state, double *d_flux, double *d_tend,
+                                            double dt) {
+    dim3 block_dim(512, 1, 1);
+    dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, (nz + 1 + block_dim.y - 1) / block_dim.y,
+                  1);
+
+    compute_tendencies_z_flux_kernel<<<grid_dim, block_dim>>>( d_state, d_flux, d_tend, dt);
+  CUDA_CHECK_KERNEL();
+
+}
 __global__ void compute_tendencies_z_kernel( double *d_state, double *d_flux, double *d_tend, double dt) {
   extern __shared__ double sdata[];
 
@@ -546,8 +664,11 @@ void compute_tendencies_z( double *state , double *flux , double *tend , double 
   int shared_height = block_dim.y;
   int shared_memory_size = NUM_VARS * shared_width * shared_height * sizeof(double);
 
-  compute_tendencies_z_kernel<<<grid_dim, block_dim, shared_memory_size>>>( state, flux, tend, dt);
-  CUDA_CHECK_KERNEL();
+  // compute_tendencies_z_kernel<<<grid_dim, block_dim, shared_memory_size>>>( state, flux, tend, dt);
+  // CUDA_CHECK_KERNEL();
+
+  //TODO: Change this back later
+  compute_tendecies_z_flux_host(state, flux, tend, dt);
 
   block_dim = dim3(192, 1, 1);
   grid_dim = dim3((nx + block_dim.x - 1) / block_dim.x, (nz + block_dim.y - 1) / block_dim.y,
