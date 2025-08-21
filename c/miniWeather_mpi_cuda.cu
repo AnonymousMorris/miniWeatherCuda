@@ -210,7 +210,6 @@ int main(int argc, char **argv) {
     if (etime + dt > sim_time) { dt = sim_time - etime; }
     //Perform a single time step
     perform_timestep(d_state,d_state_tmp,d_flux,d_tend,dt);
-    CUDA_CHECK(cudaMemcpy(state, d_state, state_size*sizeof(double), cudaMemcpyDeviceToHost));
     //Inform the user
 #ifndef NO_INFORM
     if (mainproc) { printf( "Elapsed Time: %lf / %lf\n", etime , sim_time ); }
