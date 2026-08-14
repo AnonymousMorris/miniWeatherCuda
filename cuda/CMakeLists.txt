@@ -76,3 +76,6 @@ if (CMAKE_CUDA_COMPILER)
   configure_file(check_output.sh check_output.sh COPYONLY)
   add_test(NAME CUDA_TEST COMMAND ./check_output.sh ./cuda_test 1e-13 4.5e-5 ) 
 endif()
+
+add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/cuda_test"
+                 "${CMAKE_CURRENT_BINARY_DIR}/reference_tests")

@@ -160,7 +160,6 @@ double dmin( double a , double b ) { if (a<b) {return a;} else {return b;} };
         cudaDeviceSynchronize();                                            \
         exit(1);                                                            \
     }                                                                       \
-    cudaDeviceSynchronize();                                                \
 } while(0)
 
 
@@ -223,6 +222,7 @@ int main(int argc, char **argv) {
       output(state,etime);
     }
   }
+  CUDA_CHECK(cudaStreamSynchronize(0));
   auto t2 = std::chrono::steady_clock::now();
   if (mainproc) {
     std::cout << "CPU Time: " << std::chrono::duration<double>(t2-t1).count() << " sec\n";
@@ -1325,7 +1325,7 @@ __host__ void reductions_host(double &mass, double &te) {
     d_state, mass_result, te_result);
 
   CUDA_CHECK_KERNEL();
-
+  CUDA_CHECK(cudaStreamSynchronize(0));
 
   mass = *mass_result;
   te = *te_result;
