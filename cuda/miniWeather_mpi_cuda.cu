@@ -271,39 +271,32 @@ void perform_timestep( double *d_state , double *d_state_tmp , double *d_flux , 
 
 }
 
-__global__ void compute_gravity_waves_discrete_step(double *state_init, double *state_out,
-                                                    double *d_tend) {
-  int i, k, ll, indw;
-  double x, z, wpert, dist, x0, z0, xrad, zrad, amp;
+__global__ void apply_gravity_wave_source(double *d_tend) {
+  int k = blockIdx.y * blockDim.y + threadIdx.y;
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-  ll = blockIdx.z * blockDim.z + threadIdx.z;
-  k = blockIdx.y * blockDim.y + threadIdx.y;
-  i = blockIdx.x * blockDim.x + threadIdx.x;
-
-  if (i < d_nx && k < d_nz && ll < NUM_VARS) {
-    x = (d_i_beg + i + 0.5) * dx;
-    z = (d_k_beg + k + 0.5) * dz;
+  if (i < d_nx && k < d_nz) {
+    double x = (d_i_beg + i + 0.5) * dx;
+    double z = (d_k_beg + k + 0.5) * dz;
     // Using sample_ellipse_cosine requires "acc routine" in OpenACC and "declare
-    // target" in OpenMP offload Neither of these are particularly well supported.
-    // So I'm manually inlining here wpert = sample_ellipse_cosine( x,z , 0.01 ,
-    // xlen/8,1000., 500.,500. );
-    {
-      x0   = xlen/8;
-      z0   = 1000;
-      xrad = 500;
-      zrad = 500;
-      amp  = 0.01;
-      // Compute distance from bubble center
-      dist = sqrt( ((x-x0)/xrad)*((x-x0)/xrad) + ((z-z0)/zrad)*((z-z0)/zrad) ) * pi / 2.;
-      //If the distance from bubble center is less than the radius, create a cos**2 profile
-      if (dist <= pi / 2.) {
-        wpert = amp * pow(cos(dist), 2.);
-      } else {
-        wpert = 0.;
-      }
-      indw = ID_WMOM*d_nz*d_nx + k*d_nx + i;
-      atomicAdd(&d_tend[indw], wpert * d_hy_dens_cell_ptr[hs + k]);
+    // target" in OpenMP offload. Neither of these are particularly well supported,
+    // so it is manually inlined here.
+    double x0   = xlen / 8;
+    double z0   = 1000;
+    double xrad = 500;
+    double zrad = 500;
+    double amp  = 0.01;
+    // Compute distance from bubble center
+    double dist = sqrt(((x-x0)/xrad)*((x-x0)/xrad) + ((z-z0)/zrad)*((z-z0)/zrad)) * pi / 2.;
+    // If the distance from bubble center is less than the radius, create a cos**2 profile
+    double wpert;
+    if (dist <= pi / 2.) {
+      wpert = amp * pow(cos(dist),2.);
+    } else {
+      wpert = 0.;
     }
+    int indw = ID_WMOM*d_nz*d_nx + k*d_nx + i;
+    d_tend[indw] += wpert * d_hy_dens_cell_ptr[hs + k];
   }
 }
 
@@ -327,8 +320,6 @@ __global__ void compute_discrete_step(double *d_state_init, double *d_state_out,
 //state_out = state_init + dt * rhs(state_forcing)
 //Meaning the step starts from state_init, computes the rhs using state_forcing, and stores the result in state_out
 void semi_discrete_step( double *state_init , double *state_forcing , double *state_out , double dt , int dir , double *flux , double *tend ) {
-  int i, k, ll, inds, indt, indw;
-  double x, z, wpert, dist, x0, z0, xrad, zrad, amp;
   if        (dir == DIR_X) {
     //Set the halo values for this MPI task's fluid state in the x-direction
     set_halo_values_x(state_forcing);
@@ -344,9 +335,12 @@ void semi_discrete_step( double *state_init , double *state_forcing , double *st
   dim3 block_dim(192, 1, 1);
   dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, nz, NUM_VARS);
   if (data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
-    compute_gravity_waves_discrete_step<<<grid_dim, block_dim>>>(state_init, state_out, tend);
+    dim3 source_grid_dim(grid_dim.x, grid_dim.y, 1);
+    apply_gravity_wave_source<<<source_grid_dim, block_dim>>>(tend);
+    CUDA_CHECK_KERNEL();
   }
   compute_discrete_step<<<grid_dim, block_dim>>>(state_init, state_out, tend, dt);
+  CUDA_CHECK_KERNEL();
 }
 
 __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux, double *d_tend, double dt ) {
@@ -922,7 +916,7 @@ void init( int *argc , char ***argv ) {
     hy_dens_cell      [k] = 0.;
     hy_dens_theta_cell[k] = 0.;
     for (kk=0; kk<nqpoints; kk++) {
-      z = (k_beg + k-hs+0.5)*dz;
+      z = (k_beg + k-hs+0.5)*dz + (qpoints[kk]-0.5)*dz;
       //Set the fluid state based on the user's specification
       if (data_spec_int == DATA_SPEC_COLLISION      ) { collision      (0.,z,r,u,w,t,hr,ht); }
       if (data_spec_int == DATA_SPEC_THERMAL        ) { thermal        (0.,z,r,u,w,t,hr,ht); }
@@ -1234,7 +1228,20 @@ void ncwrap( int ierr , int line ) {
 
 
 void finalize() {
-  int ierr;
+  CUDA_CHECK(cudaFree(d_state));
+  CUDA_CHECK(cudaFree(d_state_tmp));
+  CUDA_CHECK(cudaFree(d_flux));
+  CUDA_CHECK(cudaFree(d_tend));
+  CUDA_CHECK(cudaFree(d_hy_dens_cell));
+  CUDA_CHECK(cudaFree(d_hy_dens_theta_cell));
+  CUDA_CHECK(cudaFree(d_hy_dens_int));
+  CUDA_CHECK(cudaFree(d_hy_dens_theta_int));
+  CUDA_CHECK(cudaFree(d_hy_pressure_int));
+  CUDA_CHECK(cudaFree(d_sendbuf_l));
+  CUDA_CHECK(cudaFree(d_sendbuf_r));
+  CUDA_CHECK(cudaFree(d_recvbuf_l));
+  CUDA_CHECK(cudaFree(d_recvbuf_r));
+
   free( state );
   free( state_tmp );
   free( flux );
@@ -1248,7 +1255,7 @@ void finalize() {
   free( sendbuf_r );
   free( recvbuf_l );
   free( recvbuf_r );
-  ierr = MPI_Finalize();
+  MPI_Finalize();
 }
 
 __global__ void reductions_kernel(double *d_state, double *mass_result, double *te_result) {
