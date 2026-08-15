@@ -670,6 +670,43 @@ void compute_tendencies_z( double *state , double *flux , double *tend , double 
   CUDA_CHECK_KERNEL();
 }
 
+__global__ void pack_x_halo( double *state, double *send_l, double *send_r ) {
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  int count = NUM_VARS * d_nz * hs;
+
+  if (index >= count) return;
+
+  int s = index % hs;
+  int k = (index / hs) % d_nz;
+  int ll = index / (hs * d_nz);
+
+  int single_state_size = (d_nx+2*hs)*(d_nz+2*hs);
+  int row = ll * single_state_size 
+    + (k + hs) * (d_nx + 2 * hs);
+
+  // packing sends internal data to the halo
+  send_l[index] = state[row + hs + s];
+  send_r[index] = state[row + d_nx + s];
+}
+
+__global__ void unpack_x_halo( double *state, double *recv_l, double *recv_r ) {
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  int count = NUM_VARS * d_nz * hs;
+
+  if (index >= count) return;
+
+  int s = index % hs;
+  int k = (index / hs) % d_nz;
+  int ll = index / (hs * d_nz);
+
+  int single_state_size = (d_nx+2*hs)*(d_nz+2*hs);
+  int row = ll * single_state_size
+    + (k + hs) * (d_nx + 2 * hs);
+
+  state[row + s] = recv_l[index];
+  state[row + d_nx + hs + s] = recv_r[index];
+}
+
 __global__ void set_halo_values_x_kernel( double *d_state ) {
   int k, ll;
   k = blockIdx.x * blockDim.x + threadIdx.x;
@@ -716,46 +753,43 @@ void set_halo_values_x( double *state ) {
     set_halo_values_x_kernel<<<grid_dim, block_dim>>>(state);
     CUDA_CHECK_KERNEL();
   } else {
-    // TODO: Port this to CUDA
-    printf("NOT IMPLEMENTED YET");
-    exit(1);
-    MPI_Request req_r[2], req_s[2];
+    MPI_Request recv_req[2], send_req[2];
+    int req_size = hs * nz * NUM_VARS;
 
     //Prepost receives
-    ierr = MPI_Irecv(recvbuf_l,hs*nz*NUM_VARS,MPI_DOUBLE, left_rank,0,MPI_COMM_WORLD,&req_r[0]);
-    ierr = MPI_Irecv(recvbuf_r,hs*nz*NUM_VARS,MPI_DOUBLE,right_rank,1,MPI_COMM_WORLD,&req_r[1]);
+    ierr = MPI_Irecv(
+        d_recvbuf_l, req_size, MPI_DOUBLE, 
+        left_rank, 0, MPI_COMM_WORLD, &recv_req[0]);
+    ierr = MPI_Irecv(
+        d_recvbuf_r, req_size, MPI_DOUBLE, 
+        right_rank, 1, MPI_COMM_WORLD, &recv_req[1]);
 
-    //Pack the send buffers
-#pragma omp parallel for collapse(3)
-    for (ll=0; ll<NUM_VARS; ll++) {
-      for (k=0; k<nz; k++) {
-        for (s=0; s<hs; s++) {
-          sendbuf_l[ll*nz*hs + k*hs + s] = state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + hs+s];
-          sendbuf_r[ll*nz*hs + k*hs + s] = state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + nx+s];
-        }
-      }
-    }
+    int threads = 256;
+    int blocks = (req_size + threads - 1) / threads;
+    pack_x_halo<<<blocks, threads>>>(state, d_sendbuf_l, d_sendbuf_r);
+    CUDA_CHECK_KERNEL();
 
+
+    CUDA_CHECK(cudaStreamSynchronize(0));
     //Fire off the sends
-    ierr = MPI_Isend(sendbuf_l,hs*nz*NUM_VARS,MPI_DOUBLE, left_rank,1,MPI_COMM_WORLD,&req_s[0]);
-    ierr = MPI_Isend(sendbuf_r,hs*nz*NUM_VARS,MPI_DOUBLE,right_rank,0,MPI_COMM_WORLD,&req_s[1]);
+    ierr = MPI_Isend(
+        d_sendbuf_l, req_size, MPI_DOUBLE,
+        left_rank, 1, MPI_COMM_WORLD, &send_req[0]);
+    ierr = MPI_Isend(
+        d_sendbuf_r, req_size, MPI_DOUBLE,
+        right_rank, 0, MPI_COMM_WORLD, &send_req[1]);
 
     //Wait for receives to finish
-    ierr = MPI_Waitall(2,req_r,MPI_STATUSES_IGNORE);
+    ierr = MPI_Waitall(2, recv_req, MPI_STATUSES_IGNORE);
 
-    //Unpack the receive buffers
-#pragma omp parallel for collapse(3)
-    for (ll=0; ll<NUM_VARS; ll++) {
-      for (k=0; k<nz; k++) {
-        for (s=0; s<hs; s++) {
-          state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + s      ] = recvbuf_l[ll*nz*hs + k*hs + s];
-          state[ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + nx+hs+s] = recvbuf_r[ll*nz*hs + k*hs + s];
-        }
-      }
-    }
+    unpack_x_halo<<<blocks, threads>>>(state, d_recvbuf_l, d_recvbuf_r);
+    CUDA_CHECK_KERNEL();
 
     //Wait for sends to finish
-    ierr = MPI_Waitall(2,req_s,MPI_STATUSES_IGNORE);
+    ierr = MPI_Waitall(2,send_req,MPI_STATUSES_IGNORE);
+
+    //Wait for GPU unpacking to finish before proceeding
+    CUDA_CHECK(cudaStreamSynchronize(0));
   }
 
   if (data_spec_int == DATA_SPEC_INJECTION) {
@@ -943,6 +977,18 @@ void init( int *argc , char ***argv ) {
 }
 
 void device_init() {
+  int device_count = 0;
+  CUDA_CHECK(cudaGetDeviceCount(&device_count));
+
+  if (device_count == 0) {
+    if (mainproc) {
+      printf("No cuda devices are available");
+    }
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+  }
+
+  int device = myrank % device_count;
+  CUDA_CHECK(cudaSetDevice(device));
 
   //Malloc Device state
   CUDA_CHECK(cudaMalloc((void**)&d_state, state_size * sizeof(double)));
