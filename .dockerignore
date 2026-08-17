@@ -1,0 +1,7 @@
+# The image is dependency-only. Keep repository source out of the build context
+# so a future broad COPY cannot accidentally embed it in the image.
+**
+!Dockerfile
+!.dockerignore
+!docker/
+!docker/tmux.conf
