@@ -64,8 +64,8 @@ int    constexpr nz_glob       = _NZ;            //Number of total cells in the 
 double constexpr sim_time      = _SIM_TIME;      //How many seconds to run the simulation
 double constexpr output_freq   = _OUT_FREQ;      //How frequently to output data to file (in seconds)
 int    constexpr data_spec_int = _DATA_SPEC;     //How to initialize the data
-__host__ __device__ double constexpr dx            = xlen / nx_glob; // grid spacing in the x-direction
-__host__ __device__ double constexpr dz            = zlen / nz_glob; // grid spacing in the x-direction
+double constexpr dx            = xlen / nx_glob; // grid spacing in the x-direction
+double constexpr dz            = zlen / nz_glob; // grid spacing in the z-direction
 ///////////////////////////////////////////////////////////////////////////////////////
 // END USER-CONFIGURABLE PARAMETERS
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -112,15 +112,8 @@ __constant__ double *d_hy_pressure_int_ptr;      //hydrostatic press (vert cell 
 ///////////////////////////////////////////////////////////////////////////////////////
 double etime;                 //Elapsed model time
 double output_counter;        //Helps determine when it's time to do output
-//Runtime variable arrays
+//Host fluid state used for initialization and output
 double *state;                //Fluid state.             Dimensions: (1-hs:nx+hs,1-hs:nz+hs,NUM_VARS)
-double *state_tmp;            //Fluid state.             Dimensions: (1-hs:nx+hs,1-hs:nz+hs,NUM_VARS)
-double *flux;                 //Cell interface fluxes.   Dimensions: (nx+1,nz+1,NUM_VARS)
-double *tend;                 //Fluid state tendencies.  Dimensions: (nx,nz,NUM_VARS)
-double *sendbuf_l;            //Buffer to send data to the left MPI rank
-double *sendbuf_r;            //Buffer to send data to the right MPI rank
-double *recvbuf_l;            //Buffer to receive data from the left MPI rank
-double *recvbuf_r;            //Buffer to receive data from the right MPI rank
 int    num_out = 0;           //The number of outputs performed so far
 int    direction_switch = 1;
 double mass0, te0;            //Initial domain totals for mass and total energy  
@@ -161,6 +154,27 @@ double dmin( double a , double b ) { if (a<b) {return a;} else {return b;} };
         exit(1);                                                            \
     }                                                                       \
 } while(0)
+
+static void mpi_check(int error, const char *file, int line) {
+  if (error == MPI_SUCCESS) return;
+
+  int initialized = 0;
+  MPI_Initialized(&initialized);
+  if (initialized) {
+    char message[MPI_MAX_ERROR_STRING];
+    int message_length = 0;
+    MPI_Error_string(error, message, &message_length);
+    fprintf(stderr, "MPI error at %s:%d - %.*s\n", file, line,
+            message_length, message);
+    MPI_Abort(MPI_COMM_WORLD, error);
+  } else {
+    fprintf(stderr, "MPI initialization failed at %s:%d with error %d\n",
+            file, line, error);
+  }
+  exit(EXIT_FAILURE);
+}
+
+#define MPI_CHECK(call) mpi_check((call), __FILE__, __LINE__)
 
 
 //Declaring the functions defined after "main"
@@ -343,7 +357,7 @@ void semi_discrete_step( double *state_init , double *state_forcing , double *st
   CUDA_CHECK_KERNEL();
 }
 
-__global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux, double *d_tend, double dt ) {
+__global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux, double dt ) {
     int i, k, ll, s, inds;
     i = blockIdx.x * blockDim.x + threadIdx.x;
     k = blockIdx.y * blockDim.y + threadIdx.y;
@@ -387,21 +401,18 @@ __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux
             r * u * t - hv_coef * d3_vals[ID_RHOT];
     }
 }
-__host__ void compute_tendecies_x_flux_host(double *d_state, double *d_flux, double *d_tend,
-                                            double dt) {
+__host__ void compute_tendencies_x_flux_host(double *d_state, double *d_flux, double dt) {
   dim3 block_dim(512, 1, 1);
   dim3 grid_dim((nx + 1 + block_dim.x - 1) / block_dim.x, (nz + block_dim.y - 1) / block_dim.y,
                 1);
 
-  compute_tendencies_x_flux_kernel<<<grid_dim, block_dim>>>(
-    d_state, d_flux, d_tend, dt);
+  compute_tendencies_x_flux_kernel<<<grid_dim, block_dim>>>(d_state, d_flux, dt);
 
   CUDA_CHECK_KERNEL();
 }
 
-__global__ void compute_tendencies_x_kernel( double *d_state, double *d_flux, double *d_tend, double dt ) {
-  int i, k, ll, s, inds;
-  int indt, indf1, indf2;
+__global__ void compute_tendencies_x_kernel( double *d_state, double *d_flux, double dt ) {
+  int i, k, ll, s;
   // x index in global position
   i = blockIdx.x * (blockDim.x - sten_size) + threadIdx.x;
   // z index in global position
@@ -482,34 +493,23 @@ __global__ void update_tendencies_x_kernel(double *d_flux, double *d_tend) {
 //First, compute the flux vector at each cell interface in the x-direction (including hyperviscosity)
 //Then, compute the tendencies using those fluxes
 void compute_tendencies_x( double *state , double *flux , double *tend , double dt ) {
-  dim3 block_dim(128, 1, 1);
-  dim3 grid_dim((nx + 1 + (block_dim.x - sten_size)) / (block_dim.x - sten_size + 1),
-                (nz + block_dim.y - 1) / block_dim.y, 1);
+  compute_tendencies_x_flux_host(state, flux, dt);
 
-  int shared_width = block_dim.x;
-  int shared_height = block_dim.y;
-  int shared_memory_size = NUM_VARS * shared_width * shared_height * sizeof(double);
-  // compute_tendencies_x_kernel<<<grid_dim, block_dim, shared_memory_size>>>( state, flux, tend, dt);
-  // CUDA_CHECK_KERNEL();
-
-  //TODO: change this back later
-  compute_tendecies_x_flux_host(state, flux, tend, dt);
-
-  block_dim = dim3(192, 1, 1);
-  grid_dim = dim3((nx + block_dim.x - 1) / block_dim.x, (nz + block_dim.y - 1) / block_dim.y,
-                  NUM_VARS);
+  dim3 block_dim(192, 1, 1);
+  dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, (nz + block_dim.y - 1) / block_dim.y,
+                NUM_VARS);
   update_tendencies_x_kernel<<<grid_dim, block_dim>>>(flux, tend);
   CUDA_CHECK_KERNEL();
 }
 
 
-__global__ void compute_tendencies_z_flux_kernel(double *d_state, double *d_flux, double *d_tend, double dt) {
+__global__ void compute_tendencies_z_flux_kernel(double *d_state, double *d_flux, double dt) {
     int i, k, ll, s, inds;
     i = blockIdx.x * blockDim.x + threadIdx.x;
     k = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (i < d_nx && k < d_nz + 1) {
-        volatile double r, u, w, t, p, stencil[4], d3_vals[NUM_VARS], vals[NUM_VARS], hv_coef;
+        double r, u, w, t, p, stencil[4], d3_vals[NUM_VARS], vals[NUM_VARS], hv_coef;
 
         hv_coef = -hv_beta * dz / (16 * dt);
 
@@ -552,21 +552,19 @@ __global__ void compute_tendencies_z_flux_kernel(double *d_state, double *d_flux
             r * w * t - hv_coef * d3_vals[ID_RHOT];
     }
 }
-__host__ void compute_tendecies_z_flux_host(double *d_state, double *d_flux, double *d_tend,
-                                            double dt) {
+__host__ void compute_tendencies_z_flux_host(double *d_state, double *d_flux, double dt) {
     dim3 block_dim(512, 1, 1);
     dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, (nz + 1 + block_dim.y - 1) / block_dim.y,
                   1);
 
-    compute_tendencies_z_flux_kernel<<<grid_dim, block_dim>>>( d_state, d_flux, d_tend, dt);
+    compute_tendencies_z_flux_kernel<<<grid_dim, block_dim>>>(d_state, d_flux, dt);
   CUDA_CHECK_KERNEL();
 
 }
-__global__ void compute_tendencies_z_kernel( double *d_state, double *d_flux, double *d_tend, double dt) {
+__global__ void compute_tendencies_z_kernel( double *d_state, double *d_flux, double dt) {
   extern __shared__ double sdata[];
 
-  int i, k, ll, s, inds;
-  int indt, indf1, indf2;
+  int i, k, ll, s;
   i = blockIdx.x * blockDim.x + threadIdx.x;
   k = blockIdx.y * (blockDim.y - sten_size) + threadIdx.y;
 
@@ -649,22 +647,10 @@ __global__ void update_tendencies_z_kernel(double *d_state, double *d_flux, doub
 //First, compute the flux vector at each cell interface in the z-direction (including hyperviscosity)
 //Then, compute the tendencies using those fluxes
 void compute_tendencies_z( double *state , double *flux , double *tend , double dt ) {
-  dim3 block_dim(4, 128, 1);
-  dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x,
-                (nz + 1 + block_dim.y - sten_size - 1) / (block_dim.y - sten_size), 1);
+  compute_tendencies_z_flux_host(state, flux, dt);
 
-  int shared_width = block_dim.x;
-  int shared_height = block_dim.y;
-  int shared_memory_size = NUM_VARS * shared_width * shared_height * sizeof(double);
-
-  // compute_tendencies_z_kernel<<<grid_dim, block_dim, shared_memory_size>>>( state, flux, tend, dt);
-  // CUDA_CHECK_KERNEL();
-
-  //TODO: Change this back later
-  compute_tendecies_z_flux_host(state, flux, tend, dt);
-
-  block_dim = dim3(192, 1, 1);
-  grid_dim = dim3((nx + block_dim.x - 1) / block_dim.x, (nz + block_dim.y - 1) / block_dim.y,
+  dim3 block_dim(192, 1, 1);
+  dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, (nz + block_dim.y - 1) / block_dim.y,
                 NUM_VARS);
   update_tendencies_z_kernel<<<grid_dim, block_dim>>>(state, flux, tend);
   CUDA_CHECK_KERNEL();
@@ -721,7 +707,7 @@ __global__ void set_halo_values_x_kernel( double *d_state ) {
 }
 
 __global__ void data_spec_injection_kernel(double *d_state) {
-  int i, k, ll;
+  int i, k;
   int ind_r, ind_u, ind_t;
   double z;
 
@@ -744,9 +730,6 @@ __global__ void data_spec_injection_kernel(double *d_state) {
 
 //Set this MPI task's halo values in the x-direction. This routine will require MPI
 void set_halo_values_x( double *state ) {
-  int k, ll, ind_r, ind_u, ind_t, i, s, ierr;
-  double z;
-
   if (nranks == 1) {
     dim3 block_dim(1024, 1, 1);
     dim3 grid_dim((nz + block_dim.x - 1) / block_dim.x, NUM_VARS, 1);
@@ -757,12 +740,12 @@ void set_halo_values_x( double *state ) {
     int req_size = hs * nz * NUM_VARS;
 
     //Prepost receives
-    ierr = MPI_Irecv(
-        d_recvbuf_l, req_size, MPI_DOUBLE, 
-        left_rank, 0, MPI_COMM_WORLD, &recv_req[0]);
-    ierr = MPI_Irecv(
-        d_recvbuf_r, req_size, MPI_DOUBLE, 
-        right_rank, 1, MPI_COMM_WORLD, &recv_req[1]);
+    MPI_CHECK(MPI_Irecv(
+        d_recvbuf_l, req_size, MPI_DOUBLE,
+        left_rank, 0, MPI_COMM_WORLD, &recv_req[0]));
+    MPI_CHECK(MPI_Irecv(
+        d_recvbuf_r, req_size, MPI_DOUBLE,
+        right_rank, 1, MPI_COMM_WORLD, &recv_req[1]));
 
     int threads = 256;
     int blocks = (req_size + threads - 1) / threads;
@@ -772,21 +755,21 @@ void set_halo_values_x( double *state ) {
 
     CUDA_CHECK(cudaStreamSynchronize(0));
     //Fire off the sends
-    ierr = MPI_Isend(
+    MPI_CHECK(MPI_Isend(
         d_sendbuf_l, req_size, MPI_DOUBLE,
-        left_rank, 1, MPI_COMM_WORLD, &send_req[0]);
-    ierr = MPI_Isend(
+        left_rank, 1, MPI_COMM_WORLD, &send_req[0]));
+    MPI_CHECK(MPI_Isend(
         d_sendbuf_r, req_size, MPI_DOUBLE,
-        right_rank, 0, MPI_COMM_WORLD, &send_req[1]);
+        right_rank, 0, MPI_COMM_WORLD, &send_req[1]));
 
     //Wait for receives to finish
-    ierr = MPI_Waitall(2, recv_req, MPI_STATUSES_IGNORE);
+    MPI_CHECK(MPI_Waitall(2, recv_req, MPI_STATUSES_IGNORE));
 
     unpack_x_halo<<<blocks, threads>>>(state, d_recvbuf_l, d_recvbuf_r);
     CUDA_CHECK_KERNEL();
 
     //Wait for sends to finish
-    ierr = MPI_Waitall(2,send_req,MPI_STATUSES_IGNORE);
+    MPI_CHECK(MPI_Waitall(2, send_req, MPI_STATUSES_IGNORE));
 
     //Wait for GPU unpacking to finish before proceeding
     CUDA_CHECK(cudaStreamSynchronize(0));
@@ -839,13 +822,13 @@ void set_halo_values_z( double *state ) {
 
 
 void init( int *argc , char ***argv ) {
-  int    i, k, ii, kk, ll, ierr, inds, i_end;
+  int    i, k, ii, kk, ll, inds, i_end;
   double x, z, r, u, w, t, hr, ht, nper;
 
-  ierr = MPI_Init(argc,argv);
+  MPI_CHECK(MPI_Init(argc,argv));
 
-  ierr = MPI_Comm_size(MPI_COMM_WORLD,&nranks);
-  ierr = MPI_Comm_rank(MPI_COMM_WORLD,&myrank);
+  MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD,&nranks));
+  MPI_CHECK(MPI_Comm_rank(MPI_COMM_WORLD,&myrank));
   nper = ( (double) nx_glob ) / nranks;
   i_beg = round( nper* (myrank)    );
   i_end = round( nper*((myrank)+1) )-1;
@@ -872,20 +855,13 @@ void init( int *argc , char ***argv ) {
   flux_size  = (nx+1)*(nz+1)*NUM_VARS;
   tend_size  = nx*nz*NUM_VARS;
 
-  //Allocate the model data
+  //Allocate the host data needed for initialization and output
   state              = (double *) malloc( state_size*sizeof(double) );
-  state_tmp          = (double *) malloc( state_size*sizeof(double) );
-  flux               = (double *) malloc( flux_size *sizeof(double) );
-  tend               = (double *) malloc( tend_size *sizeof(double) );
   hy_dens_cell       = (double *) malloc( (nz+2*hs)*sizeof(double) );
   hy_dens_theta_cell = (double *) malloc( (nz+2*hs)*sizeof(double) );
   hy_dens_int        = (double *) malloc( (nz+1)*sizeof(double) );
   hy_dens_theta_int  = (double *) malloc( (nz+1)*sizeof(double) );
   hy_pressure_int    = (double *) malloc( (nz+1)*sizeof(double) );
-  sendbuf_l          = (double *) malloc( hs*nz*NUM_VARS*sizeof(double) );
-  sendbuf_r          = (double *) malloc( hs*nz*NUM_VARS*sizeof(double) );
-  recvbuf_l          = (double *) malloc( hs*nz*NUM_VARS*sizeof(double) );
-  recvbuf_r          = (double *) malloc( hs*nz*NUM_VARS*sizeof(double) );
 
   //Define the maximum stable time step based on an assumed maximum wind speed
   dt = dmin(dx,dz) / max_speed * cfl;
@@ -900,7 +876,7 @@ void init( int *argc , char ***argv ) {
     printf( "dt: %lf\n",dt);
   }
   //Want to make sure this info is displayed before further output
-  ierr = MPI_Barrier(MPI_COMM_WORLD);
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
   //////////////////////////////////////////////////////////////////////////
   // Initialize the cell-averaged fluid state via Gauss-Legendre quadrature
@@ -937,10 +913,6 @@ void init( int *argc , char ***argv ) {
           inds = ID_RHOT*(nz+2*hs)*(nx+2*hs) + k*(nx+2*hs) + i;
           state[inds] = state[inds] + ( (r+hr)*(t+ht) - hr*ht ) * qweights[ii]*qweights[kk];
         }
-      }
-      for (ll=0; ll<NUM_VARS; ll++) {
-        inds = ll*(nz+2*hs)*(nx+2*hs) + k*(nx+2*hs) + i;
-        state_tmp[inds] = state[inds];
       }
     }
   }
@@ -996,11 +968,10 @@ void device_init() {
   CUDA_CHECK(cudaMalloc((void**)&d_flux, flux_size * sizeof(double)));
   CUDA_CHECK(cudaMalloc((void**)&d_tend, tend_size * sizeof(double)));
 
-  //Copy initialized host data to device
+  //Copy the initialized fluid state and duplicate it on the device.
+  //Every flux and tendency entry that is read is written by a kernel first.
   CUDA_CHECK(cudaMemcpy(d_state, state, state_size * sizeof(double), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_state_tmp, state_tmp, state_size * sizeof(double), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_flux, flux, flux_size * sizeof(double), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_tend, tend, tend_size * sizeof(double), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_state_tmp, d_state, state_size * sizeof(double), cudaMemcpyDeviceToDevice));
 
   //Allocate hydrostatic array
   int hy_dens_cell_size       = (nz+2*hs);
@@ -1289,18 +1260,11 @@ void finalize() {
   CUDA_CHECK(cudaFree(d_recvbuf_r));
 
   free( state );
-  free( state_tmp );
-  free( flux );
-  free( tend );
   free( hy_dens_cell );
   free( hy_dens_theta_cell );
   free( hy_dens_int );
   free( hy_dens_theta_int );
   free( hy_pressure_int );
-  free( sendbuf_l );
-  free( sendbuf_r );
-  free( recvbuf_l );
-  free( recvbuf_r );
   MPI_Finalize();
 }
 
@@ -1396,7 +1360,7 @@ void reductions(double &mass, double &te) {
     double glob[2], loc[2];
     loc[0] = mass;
     loc[1] = te;
-    int ierr = MPI_Allreduce(loc, glob, 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_CHECK(MPI_Allreduce(loc, glob, 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD));
     mass = glob[0];
     te = glob[1];
 }
