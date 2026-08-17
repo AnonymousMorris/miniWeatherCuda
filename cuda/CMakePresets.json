@@ -20,12 +20,38 @@
         "MPI_LINK_FLAGS": "-lmpi",
         "CUDA_LINK_FLAGS": "-lcudart -lmpi"
       }
+    },
+    {
+      "name": "vastai",
+      "displayName": "Vast.ai CUDA build",
+      "binaryDir": "${sourceDir}/build/vastai",
+      "environment": {
+        "PATH": "/opt/openmpi/bin:$penv{PATH}",
+        "LD_LIBRARY_PATH": "/opt/pnetcdf/lib:/opt/openmpi/lib:$penv{LD_LIBRARY_PATH}"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_POLICY_VERSION_MINIMUM": "3.5",
+        "CMAKE_CXX_COMPILER": "/opt/openmpi/bin/mpicxx",
+        "CMAKE_CUDA_COMPILER": "/usr/local/cuda/bin/nvcc",
+        "CMAKE_CUDA_HOST_COMPILER": "/usr/bin/g++",
+        "CMAKE_CUDA_ARCHITECTURES": "native",
+        "CMAKE_CUDA_FLAGS": "-DNO_INFORM -I/opt/pnetcdf/include -I/opt/openmpi/include",
+        "CXXFLAGS": "-O3 -DNO_INFORM -std=c++11 -I/opt/pnetcdf/include -I/opt/openmpi/include",
+        "LDFLAGS": "-L/opt/pnetcdf/lib -L/opt/openmpi/lib -Wl,-rpath,/opt/pnetcdf/lib -Wl,-rpath,/opt/openmpi/lib -lpnetcdf",
+        "MPI_LINK_FLAGS": "-L/opt/openmpi/lib -Wl,-rpath,/opt/openmpi/lib -lmpi",
+        "CUDA_LINK_FLAGS": "-L/opt/openmpi/lib -Wl,-rpath,/opt/openmpi/lib -lcudart -lmpi"
+      }
     }
   ],
   "buildPresets": [
     {
       "name": "local",
       "configurePreset": "local"
+    },
+    {
+      "name": "vastai",
+      "configurePreset": "vastai"
     }
   ],
   "testPresets": [
@@ -37,6 +63,18 @@
       },
       "environment": {
         "TEST_MPI_COMMAND": "mpirun -n 1"
+      }
+    },
+    {
+      "name": "vastai",
+      "configurePreset": "vastai",
+      "output": {
+        "outputOnFailure": true
+      },
+      "environment": {
+        "TEST_MPI_COMMAND": "/opt/openmpi/bin/mpirun -n 1",
+        "OMPI_ALLOW_RUN_AS_ROOT": "1",
+        "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM": "1"
       }
     }
   ]

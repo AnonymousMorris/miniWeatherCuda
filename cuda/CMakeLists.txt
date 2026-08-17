@@ -1,6 +1,9 @@
-cmake_minimum_required(VERSION 3.0)
+cmake_minimum_required(VERSION 3.24)
 project(miniWeather CXX)
 
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES 80 CACHE STRING "CUDA architectures to build")
+endif()
 enable_language(CUDA)
 
 # Enable parallel compilation
@@ -52,12 +55,12 @@ if (CMAKE_CUDA_COMPILER)
     # COMPILE_FLAGS "${EXE_DEFS} -g -G"
     # COMPILE_FLAGS "${EXE_DEFS} -fmad=false -O3"
     COMPILE_FLAGS "${EXE_DEFS} -O3"
-    CUDA_ARCHITECTURES "80")
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 
   add_executable(cuda_test miniWeather_mpi_cuda.cu)
   set_target_properties(cuda_test PROPERTIES 
     COMPILE_FLAGS "${TEST_DEFS} -O3"
-    CUDA_ARCHITECTURES "80")
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 
   if (NOT ("${LDFLAGS}" STREQUAL "") )
     target_link_libraries(cuda      "${LDFLAGS}")
