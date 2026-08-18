@@ -18,7 +18,7 @@ Run the conservation and golden-reference tests:
 ctest --preset local
 ```
 
-The reference tests run 20-second collision, thermal, density-current, and injection simulations and compare their final output fields with saved OpenMP results. See [`../cuda_test/README.md`](../cuda_test/README.md) for details.
+The reference tests run 20-second collision, thermal, density-current, and injection simulations and compare their final output fields with saved OpenMP results. See [`cuda_test/README.md`](cuda_test/README.md) for details.
 
 Run with one MPI rank:
 
@@ -51,7 +51,7 @@ Supported data specifications are:
 - `DATA_SPEC_DENSITY_CURRENT`
 - `DATA_SPEC_INJECTION`
 
-The current CUDA implementation supports one MPI rank. CUDA-aware halo exchange for multiple ranks is not implemented.
+The CUDA implementation supports multiple MPI ranks when built and run with a CUDA-aware MPI implementation.
 
 ## Other systems
 
