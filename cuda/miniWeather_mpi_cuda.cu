@@ -77,7 +77,6 @@ double constexpr dz            = zlen / nz_glob; // grid spacing in the z-direct
 double dt;                    //Model time step (seconds)
 int    state_size;            //Number of elements in state array
 int    flux_size;             //Number of elements in flux array
-int    tend_size;             //Number of elements in tend array
 int    nx, nz;                //Number of local grid cells in the x- and z- dimensions for this MPI task
 int    i_beg, k_beg;          //beginning index in the x- and z-directions for this MPI task
 int    nranks, myrank;        //Number of MPI ranks and my rank id
@@ -129,7 +128,6 @@ double mass , te ;            //Domain totals for mass and total energy
 double *d_state;                //Fluid state.             Dimensions: (1-hs:nx+hs,1-hs:nz+hs,NUM_VARS)
 double *d_state_tmp;            //Fluid state.             Dimensions: (1-hs:nx+hs,1-hs:nz+hs,NUM_VARS)
 double *d_flux;                 //Cell interface fluxes.   Dimensions: (nx+1,nz+1,NUM_VARS)
-double *d_tend;                 //Fluid state tendencies.  Dimensions: (nx,nz,NUM_VARS)
 double *d_sendbuf_l;            //Buffer to send data to the left MPI rank
 double *d_sendbuf_r;            //Buffer to send data to the right MPI rank
 double *d_recvbuf_l;            //Buffer to receive data from the left MPI rank
@@ -201,10 +199,12 @@ double sample_ellipse_cosine( double x , double z , double amp , double x0 , dou
 void   output               ( double etime );
 void   wait_for_output       ( );
 void   ncwrap               ( int ierr , int line );
-void   perform_timestep     ( double *d_state , double *d_state_tmp , double *d_flux , double *d_tend , double dt );
-void   semi_discrete_step   ( double *state_init , double *state_forcing , double *state_out , double dt , int dir , double *flux , double *tend );
-void   compute_tendencies_x ( double *state , double *flux , double *tend , double dt);
-void   compute_tendencies_z ( double *state , double *flux , double *tend , double dt);
+void   perform_timestep     ( double *d_state , double *d_state_tmp , double *d_flux , double dt );
+void   semi_discrete_step   ( double *state_init , double *state_forcing , double *state_out , double dt , int dir , double *flux );
+void   compute_tendencies_x_flux_host( double *state , double *flux , double dt );
+void   compute_tendencies_z_flux_host( double *state , double *flux , double dt );
+void   compute_discrete_step_x_host( double *state_init , double *state_out , double *flux , double dt );
+void   compute_discrete_step_z_host( double *state_init , double *state_forcing , double *state_out , double *flux , double dt );
 void   set_halo_values_x    ( double *state );
 void   set_halo_values_z    ( double *state );
 void   reductions           ( double &mass , double &te );
@@ -232,7 +232,7 @@ int main(int argc, char **argv) {
     //If the time step leads to exceeding the simulation time, shorten it for the last step
     if (etime + dt > sim_time) { dt = sim_time - etime; }
     //Perform a single time step
-    perform_timestep(d_state,d_state_tmp,d_flux,d_tend,dt);
+    perform_timestep(d_state,d_state_tmp,d_flux,dt);
     //Inform the user
 #ifndef NO_INFORM
     if (mainproc) { printf( "Elapsed Time: %lf / %lf\n", etime , sim_time ); }
@@ -272,102 +272,70 @@ int main(int argc, char **argv) {
 // q*     = q[n] + dt/3 * rhs(q[n])
 // q**    = q[n] + dt/2 * rhs(q*  )
 // q[n+1] = q[n] + dt/1 * rhs(q** )
-void perform_timestep( double *d_state , double *d_state_tmp , double *d_flux , double *d_tend , double dt ) {
+void perform_timestep( double *d_state , double *d_state_tmp , double *d_flux , double dt ) {
   if (direction_switch) {
     //x-direction first
-    semi_discrete_step( d_state , d_state     , d_state_tmp , dt / 3 , DIR_X , d_flux , d_tend );
-    semi_discrete_step( d_state , d_state_tmp , d_state_tmp , dt / 2 , DIR_X , d_flux , d_tend );
-    semi_discrete_step( d_state , d_state_tmp , d_state     , dt / 1 , DIR_X , d_flux , d_tend );
+    semi_discrete_step( d_state , d_state     , d_state_tmp , dt / 3 , DIR_X , d_flux );
+    semi_discrete_step( d_state , d_state_tmp , d_state_tmp , dt / 2 , DIR_X , d_flux );
+    semi_discrete_step( d_state , d_state_tmp , d_state     , dt / 1 , DIR_X , d_flux );
     //z-direction second
-    semi_discrete_step( d_state , d_state     , d_state_tmp , dt / 3 , DIR_Z , d_flux , d_tend );
-    semi_discrete_step( d_state , d_state_tmp , d_state_tmp , dt / 2 , DIR_Z , d_flux , d_tend );
-    semi_discrete_step( d_state , d_state_tmp , d_state     , dt / 1 , DIR_Z , d_flux , d_tend );
+    semi_discrete_step( d_state , d_state     , d_state_tmp , dt / 3 , DIR_Z , d_flux );
+    semi_discrete_step( d_state , d_state_tmp , d_state_tmp , dt / 2 , DIR_Z , d_flux );
+    semi_discrete_step( d_state , d_state_tmp , d_state     , dt / 1 , DIR_Z , d_flux );
   } else {
     //z-direction second
-    semi_discrete_step( d_state , d_state     , d_state_tmp , dt / 3 , DIR_Z , d_flux , d_tend );
-    semi_discrete_step( d_state , d_state_tmp , d_state_tmp , dt / 2 , DIR_Z , d_flux , d_tend );
-    semi_discrete_step( d_state , d_state_tmp , d_state     , dt / 1 , DIR_Z , d_flux , d_tend );
+    semi_discrete_step( d_state , d_state     , d_state_tmp , dt / 3 , DIR_Z , d_flux );
+    semi_discrete_step( d_state , d_state_tmp , d_state_tmp , dt / 2 , DIR_Z , d_flux );
+    semi_discrete_step( d_state , d_state_tmp , d_state     , dt / 1 , DIR_Z , d_flux );
     //x-direction first
-    semi_discrete_step( d_state , d_state     , d_state_tmp , dt / 3 , DIR_X , d_flux , d_tend );
-    semi_discrete_step( d_state , d_state_tmp , d_state_tmp , dt / 2 , DIR_X , d_flux , d_tend );
-    semi_discrete_step( d_state , d_state_tmp , d_state     , dt / 1 , DIR_X , d_flux , d_tend );
+    semi_discrete_step( d_state , d_state     , d_state_tmp , dt / 3 , DIR_X , d_flux );
+    semi_discrete_step( d_state , d_state_tmp , d_state_tmp , dt / 2 , DIR_X , d_flux );
+    semi_discrete_step( d_state , d_state_tmp , d_state     , dt / 1 , DIR_X , d_flux );
   }
   if (direction_switch) { direction_switch = 0; } else { direction_switch = 1; }
 
 }
 
-__global__ void apply_gravity_wave_source(double *d_tend) {
-  int k = blockIdx.y * blockDim.y + threadIdx.y;
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-
-  if (i < d_nx && k < d_nz) {
-    double x = (d_i_beg + i + 0.5) * dx;
-    double z = (d_k_beg + k + 0.5) * dz;
-    // Using sample_ellipse_cosine requires "acc routine" in OpenACC and "declare
-    // target" in OpenMP offload. Neither of these are particularly well supported,
-    // so it is manually inlined here.
-    double x0   = xlen / 8;
-    double z0   = 1000;
-    double xrad = 500;
-    double zrad = 500;
-    double amp  = 0.01;
-    // Compute distance from bubble center
-    double dist = sqrt(((x-x0)/xrad)*((x-x0)/xrad) + ((z-z0)/zrad)*((z-z0)/zrad)) * pi / 2.;
-    // If the distance from bubble center is less than the radius, create a cos**2 profile
-    double wpert;
-    if (dist <= pi / 2.) {
-      wpert = amp * pow(cos(dist),2.);
-    } else {
-      wpert = 0.;
-    }
-    int indw = ID_WMOM*d_nz*d_nx + k*d_nx + i;
-    d_tend[indw] += wpert * d_hy_dens_cell_ptr[hs + k];
+__device__ double gravity_wave_source(int i, int k) {
+  double x = (d_i_beg + i + 0.5) * dx;
+  double z = (d_k_beg + k + 0.5) * dz;
+  // Using sample_ellipse_cosine requires "acc routine" in OpenACC and "declare
+  // target" in OpenMP offload. Neither of these are particularly well supported,
+  // so it is manually inlined here.
+  double x0   = xlen / 8;
+  double z0   = 1000;
+  double xrad = 500;
+  double zrad = 500;
+  double amp  = 0.01;
+  // Compute distance from bubble center
+  double dist = sqrt(((x-x0)/xrad)*((x-x0)/xrad) + ((z-z0)/zrad)*((z-z0)/zrad)) * pi / 2.;
+  // If the distance from bubble center is less than the radius, create a cos**2 profile
+  double wpert;
+  if (dist <= pi / 2.) {
+    wpert = amp * pow(cos(dist),2.);
+  } else {
+    wpert = 0.;
   }
-}
-
-__global__ void compute_discrete_step(double *d_state_init, double *d_state_out, double *d_tend,
-                                      double dt) {
-  int i, k, ll, inds, indt;
-
-  ll = blockIdx.z * blockDim.z + threadIdx.z;
-  k = blockIdx.y * blockDim.y + threadIdx.y;
-  i = blockIdx.x * blockDim.x + threadIdx.x;
-
-  if (i < d_nx && k < d_nz && ll < NUM_VARS) {
-    inds = ll*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + i+hs;
-    indt = ll*d_nz*d_nx + k*d_nx + i;
-
-    d_state_out[inds] = d_state_init[inds] + dt * d_tend[indt];
-  }
+  return wpert * d_hy_dens_cell_ptr[hs + k];
 }
 
 //Perform a single semi-discretized step in time with the form:
 //state_out = state_init + dt * rhs(state_forcing)
 //Meaning the step starts from state_init, computes the rhs using state_forcing, and stores the result in state_out
-void semi_discrete_step( double *state_init , double *state_forcing , double *state_out , double dt , int dir , double *flux , double *tend ) {
-  if        (dir == DIR_X) {
+void semi_discrete_step( double *state_init , double *state_forcing , double *state_out , double dt , int dir , double *flux ) {
+  if (dir == DIR_X) {
     //Set the halo values for this MPI task's fluid state in the x-direction
     set_halo_values_x(state_forcing);
-    //Compute the time tendencies for the fluid state in the x-direction
-    compute_tendencies_x(state_forcing,flux,tend,dt);
+    //Compute interface fluxes, then apply their shared-memory differences directly
+    //to the output state without materializing a global tendency array.
+    compute_tendencies_x_flux_host(state_forcing,flux,dt);
+    compute_discrete_step_x_host(state_init,state_out,flux,dt);
   } else if (dir == DIR_Z) {
     //Set the halo values for this MPI task's fluid state in the z-direction
     set_halo_values_z(state_forcing);
-    //Compute the time tendencies for the fluid state in the z-direction
-    compute_tendencies_z(state_forcing,flux,tend,dt);
+    compute_tendencies_z_flux_host(state_forcing,flux,dt);
+    compute_discrete_step_z_host(state_init,state_forcing,state_out,flux,dt);
   }
-
-  if (data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
-    dim3 source_block_dim(192, 1, 1);
-    dim3 source_grid_dim((nx + source_block_dim.x - 1) / source_block_dim.x, nz, 1);
-    apply_gravity_wave_source<<<source_grid_dim, source_block_dim>>>(tend);
-    CUDA_CHECK_KERNEL();
-  }
-
-  dim3 state_block_dim(192, 1, 1);
-  dim3 state_grid_dim((nx + state_block_dim.x - 1) / state_block_dim.x, nz, NUM_VARS);
-  compute_discrete_step<<<state_grid_dim, state_block_dim>>>(state_init, state_out, tend, dt);
-  CUDA_CHECK_KERNEL();
 }
 
 __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux, double dt ) {
@@ -442,32 +410,50 @@ __host__ void compute_tendencies_x_flux_host(double *d_state, double *d_flux, do
   CUDA_CHECK_KERNEL();
 }
 
-__global__ void update_tendencies_x_kernel(double *d_flux, double *d_tend) {
-  int i, k, ll, indf1, indf2, indt;
+__global__ void compute_discrete_step_x_kernel(double *d_state_init, double *d_state_out,
+                                               double *d_flux, double dt) {
+  extern __shared__ double flux_tile[];
 
-  ll = blockIdx.z * blockDim.z + threadIdx.z;
-  k = blockIdx.y * blockDim.y + threadIdx.y;
-  i = blockIdx.x * blockDim.x + threadIdx.x;
+  int ll = blockIdx.z;
+  int k = blockIdx.y;
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int tile_width = blockDim.x + 1;
+  int tile_start = blockIdx.x * blockDim.x;
+  int flux_row_stride = d_nx + 1;
+  int flux_var_stride = (d_nz + 1) * flux_row_stride;
 
-  if (ll < NUM_VARS && k < d_nz && i < d_nx) {
-    indt = ll * d_nz * d_nx + k * d_nx + i;
-    indf1 = ll * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i;
-    indf2 = ll * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i + 1;
-    d_tend[indt] = -(d_flux[indf2] - d_flux[indf1]) / dx;
+  if (k < d_nz) {
+    for (int tile_x = threadIdx.x; tile_x < tile_width; tile_x += blockDim.x) {
+      int flux_i = tile_start + tile_x;
+      if (flux_i <= d_nx) {
+        int indf = ll * flux_var_stride + k * flux_row_stride + flux_i;
+        flux_tile[tile_x] = d_flux[indf];
+      }
+    }
+  }
+
+  __syncthreads();
+
+  if (i < d_nx && k < d_nz) {
+    double tendency = -(flux_tile[threadIdx.x + 1] - flux_tile[threadIdx.x]) / dx;
+    if (data_spec_int == DATA_SPEC_GRAVITY_WAVES && ll == ID_WMOM) {
+      tendency += gravity_wave_source(i,k);
+    }
+
+    int state_row_stride = d_nx + 2 * hs;
+    int state_var_stride = (d_nz + 2 * hs) * state_row_stride;
+    int inds = ll * state_var_stride + (k + hs) * state_row_stride + i + hs;
+    d_state_out[inds] = d_state_init[inds] + dt * tendency;
   }
 }
 
-//Compute the time tendencies of the fluid state using forcing in the x-direction
-//Since the halos are set in a separate routine, this will not require MPI
-//First, compute the flux vector at each cell interface in the x-direction (including hyperviscosity)
-//Then, compute the tendencies using those fluxes
-void compute_tendencies_x( double *state , double *flux , double *tend , double dt ) {
-  compute_tendencies_x_flux_host(state, flux, dt);
+void compute_discrete_step_x_host(double *state_init, double *state_out, double *flux,
+                                  double dt) {
+  dim3 block_dim(256, 1, 1);
+  dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, nz, NUM_VARS);
+  int smem_size = (block_dim.x + 1) * sizeof(double);
 
-  dim3 block_dim(192, 1, 1);
-  dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, (nz + block_dim.y - 1) / block_dim.y,
-                NUM_VARS);
-  update_tendencies_x_kernel<<<grid_dim, block_dim>>>(flux, tend);
+  compute_discrete_step_x_kernel<<<grid_dim,block_dim,smem_size>>>(state_init,state_out,flux,dt);
   CUDA_CHECK_KERNEL();
 }
 
@@ -546,38 +532,77 @@ __host__ void compute_tendencies_z_flux_host(double *d_state, double *d_flux, do
   compute_tendencies_z_flux_kernel<<<grid_dim, block_dim>>>(d_state, d_flux, dt);
   CUDA_CHECK_KERNEL();
 }
-__global__ void update_tendencies_z_kernel(double *d_state, double *d_flux, double *d_tend) {
-  int i, k, ll, inds, indf1, indf2, indt;
 
-  i = blockIdx.x * blockDim.x + threadIdx.x;
-  k = blockIdx.y * blockDim.y + threadIdx.y;
-  ll = blockIdx.z * blockDim.z + threadIdx.z;
+__global__ void compute_discrete_step_z_kernel(double *d_state_init, double *d_state_forcing,
+                                               double *d_state_out, double *d_flux, double dt) {
+  extern __shared__ double flux_tile[];
 
-  if (ll < NUM_VARS && k < d_nz && i < d_nx) {
-    indt = ll * d_nz * d_nx + k * d_nx + i;
-    indf1 = ll * (d_nz + 1) * (d_nx + 1) + (k) * (d_nx + 1) + i;
-    indf2 = ll * (d_nz + 1) * (d_nx + 1) + (k + 1) * (d_nx + 1) + i;
-    d_tend[indt] = -(d_flux[indf2] - d_flux[indf1]) / dz;
-    if (ll == ID_WMOM) {
-      inds =
-        ID_DENS * (d_nz + 2 * hs) * (d_nx + 2 * hs) + (k + hs) * (d_nx + 2 * hs) + i + hs;
-      d_tend[indt] = d_tend[indt] - d_state[inds] * grav;
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int k = blockIdx.y * blockDim.y + threadIdx.y;
+  int tile_width = blockDim.x;
+  int tile_height = blockDim.y + 1;
+  int tile_elements = tile_width * tile_height;
+  int tile_start_i = blockIdx.x * blockDim.x;
+  int tile_start_k = blockIdx.y * blockDim.y;
+  int linear_thread = threadIdx.y * blockDim.x + threadIdx.x;
+  int block_threads = blockDim.x * blockDim.y;
+  int flux_row_stride = d_nx + 1;
+  int flux_var_stride = (d_nz + 1) * flux_row_stride;
+
+  for (int ll = 0; ll < NUM_VARS; ll++) {
+    for (int tile_idx = linear_thread; tile_idx < tile_elements;
+         tile_idx += block_threads) {
+      int tile_i = tile_idx % tile_width;
+      int tile_k = tile_idx / tile_width;
+      int flux_i = tile_start_i + tile_i;
+      int flux_k = tile_start_k + tile_k;
+      if (flux_i < d_nx && flux_k <= d_nz) {
+        int indf = ll * flux_var_stride + flux_k * flux_row_stride + flux_i;
+        flux_tile[ll * tile_elements + tile_idx] = d_flux[indf];
+      }
+    }
+  }
+
+  __syncthreads();
+
+  if (i < d_nx && k < d_nz) {
+    // The forcing state can alias the output during the second Runge-Kutta stage.
+    // Read density before this thread updates any variables so WMOM always uses the
+    // same forcing state that produced the fluxes.
+    int state_row_stride = d_nx + 2 * hs;
+    int state_var_stride = (d_nz + 2 * hs) * state_row_stride;
+    int density_idx = ID_DENS * state_var_stride
+                    + (k + hs) * state_row_stride + i + hs;
+    double forcing_density = d_state_forcing[density_idx];
+    double wave_source = 0.;
+    if (data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
+      wave_source = gravity_wave_source(i,k);
+    }
+
+    int tile_idx = threadIdx.y * tile_width + threadIdx.x;
+    for (int ll = 0; ll < NUM_VARS; ll++) {
+      int flux_idx = ll * tile_elements + tile_idx;
+      double tendency = -(flux_tile[flux_idx + tile_width] - flux_tile[flux_idx]) / dz;
+      if (ll == ID_WMOM) {
+        tendency -= forcing_density * grav;
+        tendency += wave_source;
+      }
+
+      int inds = ll * state_var_stride + (k + hs) * state_row_stride + i + hs;
+      d_state_out[inds] = d_state_init[inds] + dt * tendency;
     }
   }
 }
 
+void compute_discrete_step_z_host(double *state_init, double *state_forcing, double *state_out,
+                                  double *flux, double dt) {
+  dim3 block_dim(32, 8, 1);
+  dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x,
+                (nz + block_dim.y - 1) / block_dim.y, 1);
+  int smem_size = NUM_VARS * block_dim.x * (block_dim.y + 1) * sizeof(double);
 
-//Compute the time tendencies of the fluid state using forcing in the z-direction
-//Since the halos are set in a separate routine, this will not require MPI
-//First, compute the flux vector at each cell interface in the z-direction (including hyperviscosity)
-//Then, compute the tendencies using those fluxes
-void compute_tendencies_z( double *state , double *flux , double *tend , double dt ) {
-  compute_tendencies_z_flux_host(state, flux, dt);
-
-  dim3 block_dim(192, 1, 1);
-  dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, (nz + block_dim.y - 1) / block_dim.y,
-                NUM_VARS);
-  update_tendencies_z_kernel<<<grid_dim, block_dim>>>(state, flux, tend);
+  compute_discrete_step_z_kernel<<<grid_dim,block_dim,smem_size>>>(
+      state_init,state_forcing,state_out,flux,dt);
   CUDA_CHECK_KERNEL();
 }
 
@@ -784,7 +809,6 @@ void init( int *argc , char ***argv ) {
   //Initialize array sizes
   state_size = (nx+2*hs)*(nz+2*hs)*NUM_VARS;
   flux_size  = (nx+1)*(nz+1)*NUM_VARS;
-  tend_size  = nx*nz*NUM_VARS;
 
   //Allocate the host data needed for initialization and output
   state              = (double *) malloc( state_size*sizeof(double) );
@@ -897,7 +921,6 @@ void device_init() {
   CUDA_CHECK(cudaMalloc((void**)&d_state, state_size * sizeof(double)));
   CUDA_CHECK(cudaMalloc((void**)&d_state_tmp, state_size * sizeof(double)));
   CUDA_CHECK(cudaMalloc((void**)&d_flux, flux_size * sizeof(double)));
-  CUDA_CHECK(cudaMalloc((void**)&d_tend, tend_size * sizeof(double)));
 
   //A device snapshot keeps the evolving state available to the next timestep while
   //a non-blocking stream transfers the prior state into pinned host memory.
@@ -910,7 +933,7 @@ void device_init() {
   }
 
   //Copy the initialized fluid state and duplicate it on the device.
-  //Every flux and tendency entry that is read is written by a kernel first.
+  //Every flux entry that is read is written by a kernel first.
   CUDA_CHECK(cudaMemcpy(d_state, state, state_size * sizeof(double), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(d_state_tmp, d_state, state_size * sizeof(double), cudaMemcpyDeviceToDevice));
 
@@ -1224,7 +1247,6 @@ void finalize() {
   CUDA_CHECK(cudaFree(d_state));
   CUDA_CHECK(cudaFree(d_state_tmp));
   CUDA_CHECK(cudaFree(d_flux));
-  CUDA_CHECK(cudaFree(d_tend));
   CUDA_CHECK(cudaFree(d_hy_dens_cell));
   CUDA_CHECK(cudaFree(d_hy_dens_theta_cell));
   CUDA_CHECK(cudaFree(d_hy_dens_int));
