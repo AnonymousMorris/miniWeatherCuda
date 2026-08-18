@@ -15,7 +15,7 @@ function(link_miniweather_dependencies target)
   if(NOT "${MPI_LINK_FLAGS}" STREQUAL "")
     target_link_libraries(${target} PRIVATE "${MPI_LINK_FLAGS}")
   endif()
-  target_link_libraries(${target} PRIVATE "${CUDA_LINK_FLAGS}")
+  target_link_libraries(${target} PRIVATE "${CUDA_LINK_FLAGS}" Threads::Threads)
 endfunction()
 
 function(add_cuda_reference_test case_name data_spec)

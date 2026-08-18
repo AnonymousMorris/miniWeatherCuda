@@ -14,6 +14,7 @@ if(NOT N EQUAL 0)
 endif()
 
 enable_testing()
+find_package(Threads REQUIRED)
 
 include(utils.cmake)
 
@@ -73,8 +74,8 @@ if (CMAKE_CUDA_COMPILER)
   if ("${CUDA_LINK_FLAGS}" STREQUAL "")
     SET(CUDA_LINK_FLAGS ${CUDA_FLAGS})
   endif()
-  target_link_libraries(cuda      "${CUDA_LINK_FLAGS}")
-  target_link_libraries(cuda_test "${CUDA_LINK_FLAGS}")
+  target_link_libraries(cuda      "${CUDA_LINK_FLAGS}" Threads::Threads)
+  target_link_libraries(cuda_test "${CUDA_LINK_FLAGS}" Threads::Threads)
 
   configure_file(check_output.sh check_output.sh COPYONLY)
   add_test(NAME CUDA_TEST COMMAND ./check_output.sh ./cuda_test 1e-13 4.5e-5 ) 
