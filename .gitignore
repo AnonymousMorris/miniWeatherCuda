@@ -2,3 +2,8 @@
 /build-cuda/
 /cuda/build/
 /cuda/CMakeUserPresets.json
+/scripts/*
+!/scripts/build-cuda.sh
+!/scripts/d.sh
+!/scripts/profile.sh
+/profiles/
