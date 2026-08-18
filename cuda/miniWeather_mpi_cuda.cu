@@ -116,8 +116,9 @@ double etime;                 //Elapsed model time
 double output_counter;        //Helps determine when it's time to do output
 //Host fluid state used for initialization and output
 double *state;                //Fluid state.             Dimensions: (1-hs:nx+hs,1-hs:nz+hs,NUM_VARS)
+double *output_snapshot;      //Pinned host snapshot used by the background writer
 int    num_out = 0;           //The number of outputs performed so far
-std::future<void> output_future; //At most one background file write is active
+std::future<void> output_future; //At most one background output operation is active
 int    direction_switch = 1;
 double mass0, te0;            //Initial domain totals for mass and total energy  
 double mass , te ;            //Domain totals for mass and total energy  
@@ -133,6 +134,11 @@ double *d_sendbuf_l;            //Buffer to send data to the left MPI rank
 double *d_sendbuf_r;            //Buffer to send data to the right MPI rank
 double *d_recvbuf_l;            //Buffer to receive data from the left MPI rank
 double *d_recvbuf_r;            //Buffer to receive data from the right MPI rank
+double *d_output_state;         //Stable device snapshot used for asynchronous output
+cudaStream_t output_stream;       //Non-blocking stream for device-to-host output copies
+cudaEvent_t output_state_ready;   //Signals that the device snapshot is ready to transfer
+cudaEvent_t output_transfer_done; //Signals that D2H no longer reads the device snapshot
+int cuda_device;                  //CUDA device selected by this MPI rank
 
 //How is this not in the standard?!
 double dmin( double a , double b ) { if (a<b) {return a;} else {return b;} };
@@ -192,7 +198,7 @@ void   collision            ( double x , double z , double &r , double &u , doub
 void   hydro_const_theta    ( double z                   , double &r , double &t );
 void   hydro_const_bvfreq   ( double z , double bv_freq0 , double &r , double &t );
 double sample_ellipse_cosine( double x , double z , double amp , double x0 , double z0 , double xrad , double zrad );
-void   output               ( double *state , double etime );
+void   output               ( double etime );
 void   wait_for_output       ( );
 void   ncwrap               ( int ierr , int line );
 void   perform_timestep     ( double *d_state , double *d_state_tmp , double *d_flux , double *d_tend , double dt );
@@ -216,7 +222,7 @@ int main(int argc, char **argv) {
   reductions(mass0,te0);
 
   //Output the initial state
-  if (output_freq >= 0) output(state,etime);
+  if (output_freq >= 0) output(etime);
 
   ////////////////////////////////////////////////////
   // MAIN TIME STEP LOOP
@@ -237,7 +243,7 @@ int main(int argc, char **argv) {
     //If it's time for output, reset the counter, and do output
     if (output_freq >= 0 && output_counter >= output_freq) {
       output_counter = output_counter - output_freq;
-      output(state,etime);
+      output(etime);
     }
   }
   CUDA_CHECK(cudaStreamSynchronize(0));
@@ -849,14 +855,24 @@ void device_init() {
     MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
   }
 
-  int device = myrank % device_count;
-  CUDA_CHECK(cudaSetDevice(device));
+  cuda_device = myrank % device_count;
+  CUDA_CHECK(cudaSetDevice(cuda_device));
 
   //Malloc Device state
   CUDA_CHECK(cudaMalloc((void**)&d_state, state_size * sizeof(double)));
   CUDA_CHECK(cudaMalloc((void**)&d_state_tmp, state_size * sizeof(double)));
   CUDA_CHECK(cudaMalloc((void**)&d_flux, flux_size * sizeof(double)));
   CUDA_CHECK(cudaMalloc((void**)&d_tend, tend_size * sizeof(double)));
+
+  //A device snapshot keeps the evolving state available to the next timestep while
+  //a non-blocking stream transfers the prior state into pinned host memory.
+  if (output_freq >= 0) {
+    CUDA_CHECK(cudaMalloc((void**)&d_output_state, state_size * sizeof(double)));
+    CUDA_CHECK(cudaMallocHost((void**)&output_snapshot, state_size * sizeof(double)));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&output_stream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaEventCreateWithFlags(&output_state_ready, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&output_transfer_done, cudaEventDisableTiming));
+  }
 
   //Copy the initialized fluid state and duplicate it on the device.
   //Every flux and tendency entry that is read is written by a kernel first.
@@ -1115,22 +1131,33 @@ void write_output( double *state , double etime , int output_index ) {
 }
 
 
-//Take a synchronous snapshot, then let a background thread perform the expensive file write.
-//Waiting before launching the next writer keeps PNetCDF access serialized and bounds memory use.
-void output( double * /*state*/ , double etime ) {
-  double *snapshot = (double *) malloc(state_size * sizeof(double));
-  if (snapshot == nullptr) {
-    fprintf(stderr, "Unable to allocate output snapshot\n");
-    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
-  }
+//Snapshot the state on the compute stream, then transfer it to pinned host memory on
+//a non-blocking stream. D2D can overlap the previous file write, while the next timestep
+//can overlap the current D2H transfer and file write.
+void output( double etime ) {
+  const size_t snapshot_bytes = state_size * sizeof(double);
 
-  CUDA_CHECK(cudaMemcpy(snapshot, d_state, state_size * sizeof(double), cudaMemcpyDeviceToHost));
+  //Do not overwrite the device snapshot until the previous D2H has finished reading it.
+  if (num_out > 0) {
+    CUDA_CHECK(cudaStreamWaitEvent(0, output_transfer_done, 0));
+  }
+  CUDA_CHECK(cudaMemcpyAsync(d_output_state, d_state, snapshot_bytes,
+                             cudaMemcpyDeviceToDevice, 0));
+  CUDA_CHECK(cudaEventRecord(output_state_ready, 0));
+
+  //Do not overwrite the host snapshot until the previous file write has finished reading it.
   wait_for_output();
 
+  CUDA_CHECK(cudaStreamWaitEvent(output_stream, output_state_ready, 0));
+  CUDA_CHECK(cudaMemcpyAsync(output_snapshot, d_output_state, snapshot_bytes,
+                             cudaMemcpyDeviceToHost, output_stream));
+  CUDA_CHECK(cudaEventRecord(output_transfer_done, output_stream));
+
   int output_index = num_out++;
-  output_future = std::async(std::launch::async, [snapshot, etime, output_index]() {
-    write_output(snapshot, etime, output_index);
-    free(snapshot);
+  output_future = std::async(std::launch::async, [etime, output_index]() {
+    CUDA_CHECK(cudaSetDevice(cuda_device));
+    CUDA_CHECK(cudaStreamSynchronize(output_stream));
+    write_output(output_snapshot, etime, output_index);
   });
 }
 
@@ -1152,6 +1179,13 @@ void ncwrap( int ierr , int line ) {
 
 void finalize() {
   wait_for_output();
+  if (output_freq >= 0) {
+    CUDA_CHECK(cudaEventDestroy(output_state_ready));
+    CUDA_CHECK(cudaEventDestroy(output_transfer_done));
+    CUDA_CHECK(cudaStreamDestroy(output_stream));
+    CUDA_CHECK(cudaFreeHost(output_snapshot));
+    CUDA_CHECK(cudaFree(d_output_state));
+  }
   CUDA_CHECK(cudaFree(d_state));
   CUDA_CHECK(cudaFree(d_state_tmp));
   CUDA_CHECK(cudaFree(d_flux));
