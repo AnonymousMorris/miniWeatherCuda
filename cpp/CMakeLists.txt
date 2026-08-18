@@ -6,6 +6,8 @@ if ("${YAKL_ARCH}" STREQUAL "CUDA")
 endif()
 
 enable_testing()
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/build/check_output.sh"
+               "${CMAKE_CURRENT_BINARY_DIR}/check_output.sh" COPYONLY)
 
 
 ############################################################

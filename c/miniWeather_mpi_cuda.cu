@@ -271,16 +271,12 @@ void perform_timestep( double *d_state , double *d_state_tmp , double *d_flux , 
 
 }
 
-__global__ void compute_gravity_waves_discrete_step(double *state_init, double *state_out,
-                                                    double *d_tend) {
-  int i, k, ll, indw;
+__global__ void apply_gravity_wave_source(double *d_tend) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int k = blockIdx.y * blockDim.y + threadIdx.y;
   double x, z, wpert, dist, x0, z0, xrad, zrad, amp;
 
-  ll = blockIdx.z * blockDim.z + threadIdx.z;
-  k = blockIdx.y * blockDim.y + threadIdx.y;
-  i = blockIdx.x * blockDim.x + threadIdx.x;
-
-  if (i < d_nx && k < d_nz && ll < NUM_VARS) {
+  if (i < d_nx && k < d_nz) {
     x = (d_i_beg + i + 0.5) * dx;
     z = (d_k_beg + k + 0.5) * dz;
     // Using sample_ellipse_cosine requires "acc routine" in OpenACC and "declare
@@ -301,8 +297,8 @@ __global__ void compute_gravity_waves_discrete_step(double *state_init, double *
       } else {
         wpert = 0.;
       }
-      indw = ID_WMOM*d_nz*d_nx + k*d_nx + i;
-      atomicAdd(&d_tend[indw], wpert * d_hy_dens_cell_ptr[hs + k]);
+      int indw = ID_WMOM*d_nz*d_nx + k*d_nx + i;
+      d_tend[indw] += wpert * d_hy_dens_cell_ptr[hs + k];
     }
   }
 }
@@ -327,8 +323,6 @@ __global__ void compute_discrete_step(double *d_state_init, double *d_state_out,
 //state_out = state_init + dt * rhs(state_forcing)
 //Meaning the step starts from state_init, computes the rhs using state_forcing, and stores the result in state_out
 void semi_discrete_step( double *state_init , double *state_forcing , double *state_out , double dt , int dir , double *flux , double *tend ) {
-  int i, k, ll, inds, indt, indw;
-  double x, z, wpert, dist, x0, z0, xrad, zrad, amp;
   if        (dir == DIR_X) {
     //Set the halo values for this MPI task's fluid state in the x-direction
     set_halo_values_x(state_forcing);
@@ -341,12 +335,17 @@ void semi_discrete_step( double *state_init , double *state_forcing , double *st
     compute_tendencies_z(state_forcing,flux,tend,dt);
   }
 
-  dim3 block_dim(192, 1, 1);
-  dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, nz, NUM_VARS);
   if (data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
-    compute_gravity_waves_discrete_step<<<grid_dim, block_dim>>>(state_init, state_out, tend);
+    dim3 source_block_dim(192, 1, 1);
+    dim3 source_grid_dim((nx + source_block_dim.x - 1) / source_block_dim.x, nz, 1);
+    apply_gravity_wave_source<<<source_grid_dim, source_block_dim>>>(tend);
+    CUDA_CHECK_KERNEL();
   }
-  compute_discrete_step<<<grid_dim, block_dim>>>(state_init, state_out, tend, dt);
+
+  dim3 state_block_dim(192, 1, 1);
+  dim3 state_grid_dim((nx + state_block_dim.x - 1) / state_block_dim.x, nz, NUM_VARS);
+  compute_discrete_step<<<state_grid_dim, state_block_dim>>>(state_init, state_out, tend, dt);
+  CUDA_CHECK_KERNEL();
 }
 
 __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux, double *d_tend, double dt ) {
@@ -922,7 +921,7 @@ void init( int *argc , char ***argv ) {
     hy_dens_cell      [k] = 0.;
     hy_dens_theta_cell[k] = 0.;
     for (kk=0; kk<nqpoints; kk++) {
-      z = (k_beg + k-hs+0.5)*dz;
+      z = (k_beg + k-hs+0.5)*dz + (qpoints[kk]-0.5)*dz;
       //Set the fluid state based on the user's specification
       if (data_spec_int == DATA_SPEC_COLLISION      ) { collision      (0.,z,r,u,w,t,hr,ht); }
       if (data_spec_int == DATA_SPEC_THERMAL        ) { thermal        (0.,z,r,u,w,t,hr,ht); }

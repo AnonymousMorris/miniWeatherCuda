@@ -203,6 +203,7 @@ contains
       call semi_discrete_step( state , state_tmp , state_tmp , dt / 2 , DIR_X , flux , tend )
       call semi_discrete_step( state , state_tmp , state     , dt / 1 , DIR_X , flux , tend )
     endif
+    direction_switch = .not. direction_switch
   end subroutine perform_timestep
 
 
@@ -238,7 +239,7 @@ contains
     do ll = 1 , NUM_VARS
       do k = 1 , nz
         do i = 1 , nx
-          if (data_spec_int == DATA_SPEC_GRAVITY_WAVES) then
+          if (data_spec_int == DATA_SPEC_GRAVITY_WAVES .and. ll == ID_WMOM) then
             x = (i_beg-1 + i-0.5_rp) * dx
             z = (k_beg-1 + k-0.5_rp) * dz
             ! The following requires "acc routine" in OpenACC and "declare target" in OpenMP offload
@@ -403,8 +404,7 @@ contains
           state(nx+2,k,ll) = state(2   ,k,ll)
         enddo
       enddo
-      return
-    endif
+    else
 
     !Prepost receives
     call mpi_irecv(recvbuf_l,hs*nz*NUM_VARS,mpi_type, left_rank,0,MPI_COMM_WORLD,req_r(1),ierr)
@@ -446,6 +446,7 @@ contains
 
     !Wait for sends to finish
     call mpi_waitall(2,req_s,status,ierr)
+    endif
 
     if (data_spec_int == DATA_SPEC_INJECTION) then
       if (myrank == 0) then

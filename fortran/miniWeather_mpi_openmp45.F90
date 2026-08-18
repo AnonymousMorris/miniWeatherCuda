@@ -55,8 +55,6 @@ program miniweather
   real(rp), parameter :: qpoints (nqpoints) = (/ 0.112701665379258311482073460022E0_rp , 0.500000000000000000000000000000E0_rp , 0.887298334620741688517926539980E0_rp /)
   real(rp), parameter :: qweights(nqpoints) = (/ 0.277777777777777777777777777779E0_rp , 0.444444444444444444444444444444E0_rp , 0.277777777777777777777777777779E0_rp /)
 
-  integer :: asyncid = 1
-
   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
   !! BEGIN USER-CONFIGURABLE PARAMETERS
   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -112,6 +110,8 @@ program miniweather
   !Initialize MPI, allocate arrays, initialize the grid and the data
   call init(dt)
 
+  !Target operations remain synchronous so they cannot outlive Fortran dummy-array
+  !descriptors and local values in the called subroutines.
   !$omp target data map(to:state_tmp,hy_dens_cell,hy_dens_theta_cell,hy_dens_int,hy_dens_theta_int,hy_pressure_int) map(alloc:flux,tend,sendbuf_l,sendbuf_r,recvbuf_l,recvbuf_r) map(tofrom:state)
 
   !Initial reductions for mass, kinetic energy, and total energy
@@ -123,7 +123,6 @@ program miniweather
   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
   !! MAIN TIME STEP LOOP
   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-  !$omp taskwait
   if (mainproc) call system_clock(t1)
   do while (etime < sim_time)
     !If the time step leads to exceeding the simulation time, shorten it for the last step
@@ -143,7 +142,6 @@ program miniweather
       call output(state,etime)
     endif
   enddo
-  !$omp taskwait
   if (mainproc) then
     call system_clock(t2,rate)
     write(*,*) "CPU Time: ",dble(t2-t1)/dble(rate)
@@ -205,6 +203,7 @@ contains
       call semi_discrete_step( state , state_tmp , state_tmp , dt / 2 , DIR_X , flux , tend )
       call semi_discrete_step( state , state_tmp , state     , dt / 1 , DIR_X , flux , tend )
     endif
+    direction_switch = .not. direction_switch
   end subroutine perform_timestep
 
 
@@ -236,11 +235,11 @@ contains
     endif
 
     !Apply the tendencies to the fluid state
-    !$omp target teams distribute parallel do simd collapse(3) depend(inout:asyncid) nowait
+    !$omp target teams distribute parallel do simd collapse(3)
     do ll = 1 , NUM_VARS
       do k = 1 , nz
         do i = 1 , nx
-          if (data_spec_int == DATA_SPEC_GRAVITY_WAVES) then
+          if (data_spec_int == DATA_SPEC_GRAVITY_WAVES .and. ll == ID_WMOM) then
             x = (i_beg-1 + i-0.5_rp) * dx
             z = (k_beg-1 + k-0.5_rp) * dz
             ! The following requires "acc routine" in OpenACC and "declare target" in OpenMP offload
@@ -283,7 +282,7 @@ contains
     !Compute the hyperviscosity coefficient
     hv_coef = -hv_beta * dx / (16*dt)
     !Compute fluxes in the x-direction for each cell
-    !$omp target teams distribute parallel do simd collapse(2) private(stencil,vals,d3_vals) depend(inout:asyncid) nowait
+    !$omp target teams distribute parallel do simd collapse(2) private(stencil,vals,d3_vals)
     do k = 1 , nz
 
       do i = 1 , nx+1
@@ -314,7 +313,7 @@ contains
     enddo
 
     !Use the fluxes to compute tendencies for each cell
-    !$omp target teams distribute parallel do simd collapse(3) depend(inout:asyncid) nowait
+    !$omp target teams distribute parallel do simd collapse(3)
     do ll = 1 , NUM_VARS
       do k = 1 , nz
         do i = 1 , nx
@@ -340,7 +339,7 @@ contains
     !Compute the hyperviscosity coefficient
     hv_coef = -hv_beta * dz / (16*dt)
     !Compute fluxes in the x-direction for each cell
-    !$omp target teams distribute parallel do simd collapse(2) private(stencil,vals,d3_vals) depend(inout:asyncid) nowait
+    !$omp target teams distribute parallel do simd collapse(2) private(stencil,vals,d3_vals)
     do k = 1 , nz+1
 
       do i = 1 , nx
@@ -376,7 +375,7 @@ contains
     enddo
 
     !Use the fluxes to compute tendencies for each cell
-    !$omp target teams distribute parallel do simd collapse(3) depend(inout:asyncid) nowait
+    !$omp target teams distribute parallel do simd collapse(3)
     do ll = 1 , NUM_VARS
       do k = 1 , nz
         do i = 1 , nx
@@ -398,7 +397,7 @@ contains
     real(rp) :: z
 
     if (nranks == 1) then
-      !$omp target teams distribute parallel do simd collapse(2)  depend(inout:asyncid) nowait
+      !$omp target teams distribute parallel do simd collapse(2)
       do ll = 1 , NUM_VARS
         do k = 1 , nz
           state(-1  ,k,ll) = state(nx-1,k,ll)
@@ -407,15 +406,14 @@ contains
           state(nx+2,k,ll) = state(2   ,k,ll)
         enddo
       enddo
-      return
-    endif
+    else
 
     !Prepost receives
     call mpi_irecv(recvbuf_l,hs*nz*NUM_VARS,mpi_type, left_rank,0,MPI_COMM_WORLD,req_r(1),ierr)
     call mpi_irecv(recvbuf_r,hs*nz*NUM_VARS,mpi_type,right_rank,1,MPI_COMM_WORLD,req_r(2),ierr)
 
     !Pack the send buffers
-    !$omp target teams distribute parallel do simd collapse(3)  depend(inout:asyncid) nowait
+    !$omp target teams distribute parallel do simd collapse(3)
     do ll = 1 , NUM_VARS
       do k = 1 , nz
         do s = 1 , hs
@@ -425,8 +423,7 @@ contains
       enddo
     enddo
 
-    !$omp target update from(sendbuf_l,sendbuf_r) depend(inout:asyncid) nowait
-    !$omp taskwait
+    !$omp target update from(sendbuf_l,sendbuf_r)
 
     !Fire off the sends
     call mpi_isend(sendbuf_l,hs*nz*NUM_VARS,mpi_type, left_rank,1,MPI_COMM_WORLD,req_s(1),ierr)
@@ -435,10 +432,10 @@ contains
     !Wait for receives to finish
     call mpi_waitall(2,req_r,status,ierr)
 
-    !$omp target update to(recvbuf_l,recvbuf_r) depend(inout:asyncid) nowait
+    !$omp target update to(recvbuf_l,recvbuf_r)
 
     !Unpack the receive buffers
-    !$omp target teams distribute parallel do simd collapse(3) depend(inout:asyncid) nowait
+    !$omp target teams distribute parallel do simd collapse(3)
     do ll = 1 , NUM_VARS
       do k = 1 , nz
         do s = 1 , hs
@@ -450,10 +447,11 @@ contains
 
     !Wait for sends to finish
     call mpi_waitall(2,req_s,status,ierr)
+    endif
 
     if (data_spec_int == DATA_SPEC_INJECTION) then
       if (myrank == 0) then
-        !$omp target teams distribute parallel do simd depend(inout:asyncid) nowait
+        !$omp target teams distribute parallel do simd
         do k = 1 , nz
           z = (k_beg-1 + k-0.5_rp)*dz
           if (abs(z-3*zlen/4) <= zlen/16) then
@@ -472,7 +470,7 @@ contains
     implicit none
     real(rp), intent(inout) :: state(1-hs:nx+hs,1-hs:nz+hs,NUM_VARS)
     integer :: i, ll
-    !$omp target teams distribute parallel do simd collapse(2) depend(inout:asyncid) nowait
+    !$omp target teams distribute parallel do simd collapse(2)
     do ll = 1 , NUM_VARS
       do i = 1-hs,nx+hs
         if (ll == ID_WMOM) then
@@ -789,8 +787,7 @@ contains
     real(rp), allocatable :: dens(:,:), uwnd(:,:), wwnd(:,:), theta(:,:)
     real(rp) :: etimearr(1)
 
-    !$omp target update from(state) depend(inout:asyncid) nowait
-    !$omp taskwait
+    !$omp target update from(state)
 
     !Inform the user
     if (mainproc) write(*,*) '*** OUTPUT ***'

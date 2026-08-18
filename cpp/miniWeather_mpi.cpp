@@ -218,7 +218,7 @@ void semi_discrete_step( realConst3d state_init , real3d const &state_forcing , 
   for (int ll=0; ll<NUM_VARS; ll++) {
     for (int k=0; k<nz; k++) {
       for (int i=0; i<nx; i++) {
-        if (data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
+        if (data_spec_int == DATA_SPEC_GRAVITY_WAVES && ll == ID_WMOM) {
           real x = (i_beg + i+0.5)*dx;
           real z = (k_beg + k+0.5)*dz;
           real wpert = sample_ellipse_cosine( x,z , 0.01 , xlen/8,1000., 500.,500. );
@@ -620,7 +620,7 @@ void init( real3d &state , real &dt , Fixed_data &fixed_data ) {
     hy_dens_cell      (k) = 0.;
     hy_dens_theta_cell(k) = 0.;
     for (int kk=0; kk<nqpoints; kk++) {
-      real z = (k_beg + k-hs+0.5)*dz;
+      real z = (k_beg + k-hs+0.5)*dz + (qpoints(kk)-0.5)*dz;
       real r, u, w, t, hr, ht;
       //Set the fluid state based on the user's specification
       if (data_spec_int == DATA_SPEC_COLLISION      ) { collision      (0.,z,r,u,w,t,hr,ht); }

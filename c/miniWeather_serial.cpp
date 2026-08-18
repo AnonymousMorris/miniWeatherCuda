@@ -231,7 +231,7 @@ void semi_discrete_step( double *state_init , double *state_forcing , double *st
   for (ll=0; ll<NUM_VARS; ll++) {
     for (k=0; k<nz; k++) {
       for (i=0; i<nx; i++) {
-        if (data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
+        if (data_spec_int == DATA_SPEC_GRAVITY_WAVES && ll == ID_WMOM) {
           x = (i_beg + i+0.5)*dx;
           z = (k_beg + k+0.5)*dz;
           // Using sample_ellipse_cosine requires "acc routine" in OpenACC and "declare target" in OpenMP offload
@@ -576,7 +576,7 @@ void init( int *argc , char ***argv ) {
     hy_dens_cell      [k] = 0.;
     hy_dens_theta_cell[k] = 0.;
     for (kk=0; kk<nqpoints; kk++) {
-      z = (k_beg + k-hs+0.5)*dz;
+      z = (k_beg + k-hs+0.5)*dz + (qpoints[kk]-0.5)*dz;
       //Set the fluid state based on the user's specification
       if (data_spec_int == DATA_SPEC_COLLISION      ) { collision      (0.,z,r,u,w,t,hr,ht); }
       if (data_spec_int == DATA_SPEC_THERMAL        ) { thermal        (0.,z,r,u,w,t,hr,ht); }

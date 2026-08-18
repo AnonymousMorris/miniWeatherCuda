@@ -231,7 +231,7 @@ contains
     do ll = 1 , NUM_VARS
       do k = 1 , nz
         do i = 1 , nx
-          if (data_spec_int == DATA_SPEC_GRAVITY_WAVES) then
+          if (data_spec_int == DATA_SPEC_GRAVITY_WAVES .and. ll == ID_WMOM) then
             x = (i_beg-1 + i-0.5_rp) * dx
             z = (k_beg-1 + k-0.5_rp) * dz
             ! The following requires "acc routine" in OpenACC and "declare target" in OpenMP offload

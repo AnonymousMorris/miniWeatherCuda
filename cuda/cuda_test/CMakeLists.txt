@@ -47,5 +47,6 @@ endfunction()
 
 add_cuda_reference_test(collision DATA_SPEC_COLLISION)
 add_cuda_reference_test(thermal DATA_SPEC_THERMAL)
+add_cuda_reference_test(gravity_waves DATA_SPEC_GRAVITY_WAVES)
 add_cuda_reference_test(density_current DATA_SPEC_DENSITY_CURRENT)
 add_cuda_reference_test(injection DATA_SPEC_INJECTION)

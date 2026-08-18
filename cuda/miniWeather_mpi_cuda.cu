@@ -346,14 +346,16 @@ void semi_discrete_step( double *state_init , double *state_forcing , double *st
     compute_tendencies_z(state_forcing,flux,tend,dt);
   }
 
-  dim3 block_dim(192, 1, 1);
-  dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, nz, NUM_VARS);
   if (data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
-    dim3 source_grid_dim(grid_dim.x, grid_dim.y, 1);
-    apply_gravity_wave_source<<<source_grid_dim, block_dim>>>(tend);
+    dim3 source_block_dim(192, 1, 1);
+    dim3 source_grid_dim((nx + source_block_dim.x - 1) / source_block_dim.x, nz, 1);
+    apply_gravity_wave_source<<<source_grid_dim, source_block_dim>>>(tend);
     CUDA_CHECK_KERNEL();
   }
-  compute_discrete_step<<<grid_dim, block_dim>>>(state_init, state_out, tend, dt);
+
+  dim3 state_block_dim(192, 1, 1);
+  dim3 state_grid_dim((nx + state_block_dim.x - 1) / state_block_dim.x, nz, NUM_VARS);
+  compute_discrete_step<<<state_grid_dim, state_block_dim>>>(state_init, state_out, tend, dt);
   CUDA_CHECK_KERNEL();
 }
 

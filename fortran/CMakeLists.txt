@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.0)
 project(miniWeather Fortran)
 
 enable_testing()
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/build/check_output.sh"
+               "${CMAKE_CURRENT_BINARY_DIR}/check_output.sh" COPYONLY)
 
 include(utils.cmake)
 
