@@ -382,6 +382,9 @@ __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux
 
         // Use fourth-order interpolation from four cell averages to compute the value at
         // the interface in question
+        // We forbid loop unrolling to force vals and d3_vals to spill onto stack. This
+        // reduces register pressure.
+        #pragma unroll 1
         for (ll = 0; ll < NUM_VARS; ll++) {
             for (s = 0; s < sten_size; s++) {
                 inds = ll * (d_nz + 2 * hs) * (d_nx + 2 * hs) + (k + hs) * (d_nx + 2 * hs) + i + s;
