@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM nvcr.io/nvidia/cuda:13.3.1-devel-ubuntu26.04
+FROM nvcr.io/nvidia/cuda:12.6.3-devel-ubuntu24.04
 
 ARG BUILD_JOBS=4
 
@@ -9,15 +9,17 @@ RUN apt-get update \
       build-essential \
       ca-certificates \
       cmake \
-      cuda-nsight-systems-13-3 \
+      cuda-nsight-systems-12-6 \
       git \
       m4 \
+      nvtop \
       openssh-client \
       perl \
       pkg-config \
       python3 \
       python3-venv \
       tmux \
+      vim \
  && rm -rf /var/lib/apt/lists/*
 
 # Install the test runner used by the CUDA reference tests.
