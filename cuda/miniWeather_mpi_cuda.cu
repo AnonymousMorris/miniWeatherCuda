@@ -376,7 +376,7 @@ __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux
     k = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (i < d_nx + 1 && k < d_nz) {
-        double r, u, w, t, p, stencil[4], d3_vals[NUM_VARS], vals[NUM_VARS], hv_coef;
+        double r, r_recip, u, w, t, p, stencil[4], d3_vals[NUM_VARS], vals[NUM_VARS], hv_coef;
         // Compute the hyperviscosity coefficient
         hv_coef = -hv_beta * dx / (16 * dt);
 
@@ -401,9 +401,10 @@ __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux
         // Compute density, u-wind, w-wind, potential temperature, and pressure (r,u,w,t,p
         // respectively)
         r = vals[ID_DENS] + d_hy_dens_cell_ptr[k + hs];
-        u = vals[ID_UMOM] / r;
-        w = vals[ID_WMOM] / r;
-        t = (vals[ID_RHOT] + d_hy_dens_theta_cell_ptr[k + hs]) / r;
+        r_recip = 1.0 / r;
+        u = vals[ID_UMOM] * r_recip;
+        w = vals[ID_WMOM] * r_recip;
+        t = (vals[ID_RHOT] + d_hy_dens_theta_cell_ptr[k + hs]) * r_recip;
         p = C0 * pow((r * t), gamm);
 
         // Compute the flux vector
