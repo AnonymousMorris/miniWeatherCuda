@@ -18,6 +18,7 @@
 #include <mpi.h>
 #include "pnetcdf.h"
 #include <chrono>
+#include <future>
 
 constexpr double pi        = 3.14159265358979323846264338327;   //Pi
 constexpr double grav      = 9.8;                               //Gravitational acceleration (m / s^2)
@@ -80,6 +81,7 @@ int    tend_size;             //Number of elements in tend array
 int    nx, nz;                //Number of local grid cells in the x- and z- dimensions for this MPI task
 int    i_beg, k_beg;          //beginning index in the x- and z-directions for this MPI task
 int    nranks, myrank;        //Number of MPI ranks and my rank id
+MPI_Comm io_comm = MPI_COMM_NULL; //Dedicated communicator for asynchronous PNetCDF I/O
 int    left_rank, right_rank; //MPI Rank IDs that exist to my left and right in the global domain
 int    mainproc;            //Am I the main process (rank == 0)?
 double *hy_dens_cell;         //hydrostatic density (vert cell avgs).   Dimensions: (1-hs:nz+hs)
@@ -115,6 +117,7 @@ double output_counter;        //Helps determine when it's time to do output
 //Host fluid state used for initialization and output
 double *state;                //Fluid state.             Dimensions: (1-hs:nx+hs,1-hs:nz+hs,NUM_VARS)
 int    num_out = 0;           //The number of outputs performed so far
+std::future<void> output_future; //At most one background file write is active
 int    direction_switch = 1;
 double mass0, te0;            //Initial domain totals for mass and total energy  
 double mass , te ;            //Domain totals for mass and total energy  
@@ -190,6 +193,7 @@ void   hydro_const_theta    ( double z                   , double &r , double &t
 void   hydro_const_bvfreq   ( double z , double bv_freq0 , double &r , double &t );
 double sample_ellipse_cosine( double x , double z , double amp , double x0 , double z0 , double xrad , double zrad );
 void   output               ( double *state , double etime );
+void   wait_for_output       ( );
 void   ncwrap               ( int ierr , int line );
 void   perform_timestep     ( double *d_state , double *d_state_tmp , double *d_flux , double *d_tend , double dt );
 void   semi_discrete_step   ( double *state_init , double *state_forcing , double *state_out , double dt , int dir , double *flux , double *tend );
@@ -237,6 +241,7 @@ int main(int argc, char **argv) {
     }
   }
   CUDA_CHECK(cudaStreamSynchronize(0));
+  wait_for_output();
   auto t2 = std::chrono::steady_clock::now();
   if (mainproc) {
     std::cout << "CPU Time: " << std::chrono::duration<double>(t2-t1).count() << " sec\n";
@@ -704,7 +709,13 @@ void init( int *argc , char ***argv ) {
   int    i, k, ii, kk, ll, inds, i_end;
   double x, z, r, u, w, t, hr, ht, nper;
 
-  MPI_CHECK(MPI_Init(argc,argv));
+  int provided;
+  MPI_CHECK(MPI_Init_thread(argc, argv, MPI_THREAD_MULTIPLE, &provided));
+  if (provided < MPI_THREAD_MULTIPLE) {
+    fprintf(stderr, "Asynchronous output requires MPI_THREAD_MULTIPLE support\n");
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+  }
+  MPI_CHECK(MPI_Comm_dup(MPI_COMM_WORLD, &io_comm));
 
   MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD,&nranks));
   MPI_CHECK(MPI_Comm_rank(MPI_COMM_WORLD,&myrank));
@@ -1012,19 +1023,13 @@ double sample_ellipse_cosine( double x , double z , double amp , double x0 , dou
 //Output the fluid state (state) to a NetCDF file at a given elapsed model time (etime)
 //The file I/O uses parallel-netcdf, the only external library required for this mini-app.
 //If it's too cumbersome, you can comment the I/O out, but you'll miss out on some potentially cool graphics
-void output( double *state , double etime ) {
+void write_output( double *state , double etime , int output_index ) {
   int ncid, t_dimid, x_dimid, z_dimid, dens_varid, uwnd_varid, wwnd_varid, theta_varid, t_varid, dimids[3];
   int i, k, ind_r, ind_u, ind_w, ind_t;
   MPI_Offset st1[1], ct1[1], st3[3], ct3[3];
   //Temporary arrays to hold density, u-wind, w-wind, and potential temperature (theta)
   double *dens, *uwnd, *wwnd, *theta;
   double *etimearr;
-  CUDA_CHECK(cudaMemcpy(state, d_state, state_size * sizeof(double), cudaMemcpyDeviceToHost));
-  // Update host data from device (equivalent to #pragma acc update host)
-  // CUDA_CHECK(cudaMemcpyAsync(state, d_state,
-  //                            (nx + 2 * hs) * (nz + 2 * hs) * NUM_VARS * sizeof(double),
-  //                            cudaMemcpyDeviceToHost, 0));
-  // CUDA_CHECK(cudaStreamSynchronize(0));
   //Inform the user
   if (mainproc) { printf("*** OUTPUT ***\n"); }
   //Allocate some (big) temp arrays
@@ -1037,7 +1042,7 @@ void output( double *state , double etime ) {
   //If the elapsed time is zero, create the file. Otherwise, open the file
   if (etime == 0) {
     //Create the file
-    ncwrap( ncmpi_create( MPI_COMM_WORLD , "output.nc" , NC_CLOBBER , MPI_INFO_NULL , &ncid ) , __LINE__ );
+    ncwrap( ncmpi_create( io_comm , "output.nc" , NC_CLOBBER , MPI_INFO_NULL , &ncid ) , __LINE__ );
     //Create the dimensions
     ncwrap( ncmpi_def_dim( ncid , "t" , (MPI_Offset) NC_UNLIMITED , &t_dimid ) , __LINE__ );
     ncwrap( ncmpi_def_dim( ncid , "x" , (MPI_Offset) nx_glob      , &x_dimid ) , __LINE__ );
@@ -1054,7 +1059,7 @@ void output( double *state , double etime ) {
     ncwrap( ncmpi_enddef( ncid ) , __LINE__ );
   } else {
     //Open the file
-    ncwrap( ncmpi_open( MPI_COMM_WORLD , "output.nc" , NC_WRITE , MPI_INFO_NULL , &ncid ) , __LINE__ );
+    ncwrap( ncmpi_open( io_comm , "output.nc" , NC_WRITE , MPI_INFO_NULL , &ncid ) , __LINE__ );
     //Get the variable IDs
     ncwrap( ncmpi_inq_varid( ncid , "dens"  ,  &dens_varid ) , __LINE__ );
     ncwrap( ncmpi_inq_varid( ncid , "uwnd"  ,  &uwnd_varid ) , __LINE__ );
@@ -1079,7 +1084,7 @@ void output( double *state , double etime ) {
   }
 
   //Write the grid data to file with all the processes writing collectively
-  st3[0] = num_out; st3[1] = k_beg; st3[2] = i_beg;
+  st3[0] = output_index; st3[1] = k_beg; st3[2] = i_beg;
   ct3[0] = 1      ; ct3[1] = nz   ; ct3[2] = nx   ;
   ncwrap( ncmpi_put_vara_double_all( ncid ,  dens_varid , st3 , ct3 , dens  ) , __LINE__ );
   ncwrap( ncmpi_put_vara_double_all( ncid ,  uwnd_varid , st3 , ct3 , uwnd  ) , __LINE__ );
@@ -1091,7 +1096,7 @@ void output( double *state , double etime ) {
   ncwrap( ncmpi_begin_indep_data(ncid) , __LINE__ );
   //write elapsed time to file
   if (mainproc) {
-    st1[0] = num_out;
+    st1[0] = output_index;
     ct1[0] = 1;
     etimearr[0] = etime; ncwrap( ncmpi_put_vara_double( ncid , t_varid , st1 , ct1 , etimearr ) , __LINE__ );
   }
@@ -1101,15 +1106,37 @@ void output( double *state , double etime ) {
   //Close the file
   ncwrap( ncmpi_close(ncid) , __LINE__ );
 
-  //Increment the number of outputs
-  num_out = num_out + 1;
-
   //Deallocate the temp arrays
   free( dens     );
   free( uwnd     );
   free( wwnd     );
   free( theta    );
   free( etimearr );
+}
+
+
+//Take a synchronous snapshot, then let a background thread perform the expensive file write.
+//Waiting before launching the next writer keeps PNetCDF access serialized and bounds memory use.
+void output( double * /*state*/ , double etime ) {
+  double *snapshot = (double *) malloc(state_size * sizeof(double));
+  if (snapshot == nullptr) {
+    fprintf(stderr, "Unable to allocate output snapshot\n");
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+  }
+
+  CUDA_CHECK(cudaMemcpy(snapshot, d_state, state_size * sizeof(double), cudaMemcpyDeviceToHost));
+  wait_for_output();
+
+  int output_index = num_out++;
+  output_future = std::async(std::launch::async, [snapshot, etime, output_index]() {
+    write_output(snapshot, etime, output_index);
+    free(snapshot);
+  });
+}
+
+
+void wait_for_output() {
+  if (output_future.valid()) output_future.get();
 }
 
 
@@ -1124,6 +1151,7 @@ void ncwrap( int ierr , int line ) {
 
 
 void finalize() {
+  wait_for_output();
   CUDA_CHECK(cudaFree(d_state));
   CUDA_CHECK(cudaFree(d_state_tmp));
   CUDA_CHECK(cudaFree(d_flux));
@@ -1144,6 +1172,7 @@ void finalize() {
   free( hy_dens_int );
   free( hy_dens_theta_int );
   free( hy_pressure_int );
+  MPI_CHECK(MPI_Comm_free(&io_comm));
   MPI_Finalize();
 }
 
