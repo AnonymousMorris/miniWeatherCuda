@@ -95,7 +95,9 @@ double *hy_pressure_int;      //hydrostatic press (vert cell interf).   Dimensio
 // Device Variables that are initialized but remain static over the course of the simulation
 ///////////////////////////////////////////////////////////////////////////////////////
 __constant__ int d_nx, d_nz;       //Number of local grid cells in the x- and z- dimensions for this MPI task
-__constant__ int d_i_beg, d_k_beg; //beginning index in the x- and z-directions for this MPI task            
+__constant__ int d_i_beg, d_k_beg; //beginning index in the x- and z-directions for this MPI task
+__constant__ int d_state_row_stride; //Number of state elements stored for each row
+__constant__ int d_state_var_stride; //Number of state elements stored for each fluid variable
 
 double *d_hy_dens_cell;         //hydrostatic density (vert cell avgs).   Dimensions: (1-hs:nz+hs)
 double *d_hy_dens_theta_cell;   //hydrostatic rho*t (vert cell avgs).     Dimensions: (1-hs:nz+hs)
@@ -328,7 +330,7 @@ __global__ void compute_discrete_step(double *d_state_init, double *d_state_out,
   i = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (i < d_nx && k < d_nz && ll < NUM_VARS) {
-    inds = ll*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + i+hs;
+    inds = ll * d_state_var_stride + (k+hs)*d_state_row_stride + i+hs;
     indt = ll*d_nz*d_nx + k*d_nx + i;
 
     d_state_out[inds] = d_state_init[inds] + dt * d_tend[indt];
@@ -363,9 +365,32 @@ void semi_discrete_step( double *state_init , double *state_forcing , double *st
 }
 
 __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux, double dt ) {
-    int i, k, ll, s, inds;
+    int i, k, ll, s;
     i = blockIdx.x * blockDim.x + threadIdx.x;
     k = blockIdx.y * blockDim.y + threadIdx.y;
+
+    extern __shared__ double smem[];
+    int tile_width = blockDim.x + sten_size - 1;
+    int tile_start = blockIdx.x * blockDim.x;
+
+    // Cooperatively load the output tile and the right-side stencil halo. The
+    // state index intentionally starts in the left halo.
+    if (k < d_nz) {
+      for (ll = 0; ll < NUM_VARS; ll++) {
+        for (int tile_x = threadIdx.x; tile_x < tile_width; tile_x += blockDim.x) {
+          int state_x = tile_start + tile_x;
+          if (state_x < d_nx + sten_size) {
+            int smem_idx = ll * tile_width + tile_x;
+            int state_idx = ll * d_state_var_stride
+                          + (k + hs) * d_state_row_stride
+                          + state_x;
+            smem[smem_idx] = d_state[state_idx];
+          }
+        }
+      }
+    }
+
+    __syncthreads();
 
     if (i < d_nx + 1 && k < d_nz) {
         double r, u, w, t, p, stencil[4], d3_vals[NUM_VARS], vals[NUM_VARS], hv_coef;
@@ -376,8 +401,8 @@ __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux
         // the interface in question
         for (ll = 0; ll < NUM_VARS; ll++) {
             for (s = 0; s < sten_size; s++) {
-                inds = ll * (d_nz + 2 * hs) * (d_nx + 2 * hs) + (k + hs) * (d_nx + 2 * hs) + i + s;
-                stencil[s] = d_state[inds];
+                int smem_idx = ll * tile_width + threadIdx.x + s;
+                stencil[s] = smem[smem_idx];
             }
             // Fourth-order-accurate interpolation of the state
             vals[ll] =
@@ -407,75 +432,14 @@ __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux
     }
 }
 __host__ void compute_tendencies_x_flux_host(double *d_state, double *d_flux, double dt) {
-  dim3 block_dim(512, 1, 1);
+  dim3 block_dim(256, 1, 1);
   dim3 grid_dim((nx + 1 + block_dim.x - 1) / block_dim.x, (nz + block_dim.y - 1) / block_dim.y,
                 1);
 
-  compute_tendencies_x_flux_kernel<<<grid_dim, block_dim>>>(d_state, d_flux, dt);
+  int smem_size = NUM_VARS * (block_dim.x + sten_size - 1) * sizeof(double);
+  compute_tendencies_x_flux_kernel<<<grid_dim, block_dim, smem_size>>>(d_state, d_flux, dt);
 
   CUDA_CHECK_KERNEL();
-}
-
-__global__ void compute_tendencies_x_kernel( double *d_state, double *d_flux, double dt ) {
-  int i, k, ll, s;
-  // x index in global position
-  i = blockIdx.x * (blockDim.x - sten_size) + threadIdx.x;
-  // z index in global position
-  k = blockIdx.y * blockDim.y + threadIdx.y;
-
-  extern __shared__ double sdata[];
-
-  int shared_size = blockDim.x * blockDim.y;
-
-  // if (i < d_nx + 2*hs && k < d_nz + 2*hs) {
-    for (ll = 0; ll < NUM_VARS; ll++) {
-      int common_offset = ll * shared_size;
-      int shared_idx = common_offset + threadIdx.y * blockDim.x + threadIdx.x;
-      int global_idx = ll * (d_nx + 2 * hs) * (d_nz + 2 * hs) + (k + hs) * (d_nx + 2 * hs) + i;
-      sdata[shared_idx] = d_state[global_idx];
-    }
-  // }
-  __syncthreads();
-
-  if (i < d_nx + 1 && k < d_nz && threadIdx.x < blockDim.x - sten_size + 1) {
-    volatile double r, u, w, t, p, stencil[4], d3_vals[NUM_VARS], vals[NUM_VARS], hv_coef;
-    // Compute the hyperviscosity coefficient
-    hv_coef = -hv_beta * dx / (16 * dt);
-
-    // Use fourth-order interpolation from four cell averages to compute the value at
-    // the interface in question
-    for (ll = 0; ll < NUM_VARS; ll++) {
-      for (s = 0; s < sten_size; s++) {
-        int common_offset = ll * shared_size;
-        int shared_idx = common_offset + threadIdx.y * blockDim.x + threadIdx.x + s;
-        stencil[s] = sdata[shared_idx];
-      }
-      // Fourth-order-accurate interpolation of the state
-      vals[ll] =
-        -stencil[0] / 12 + 7 * stencil[1] / 12 + 7 * stencil[2] / 12 - stencil[3] / 12;
-      // First-order-accurate interpolation of the third spatial derivative of the
-      // state (for artificial viscosity)
-      d3_vals[ll] = -stencil[0] + 3 * stencil[1] - 3 * stencil[2] + stencil[3];
-    }
-
-    // Compute density, u-wind, w-wind, potential temperature, and pressure (r,u,w,t,p
-    // respectively)
-    r = vals[ID_DENS] + d_hy_dens_cell_ptr[k + hs];
-    u = vals[ID_UMOM] / r;
-    w = vals[ID_WMOM] / r;
-    t = (vals[ID_RHOT] + d_hy_dens_theta_cell_ptr[k + hs]) / r;
-    p = C0 * pow((r * t), gamm);
-
-    // Compute the flux vector
-    d_flux[ID_DENS * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
-      r * u - hv_coef * d3_vals[ID_DENS];
-    d_flux[ID_UMOM * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
-      r * u * u + p - hv_coef * d3_vals[ID_UMOM];
-    d_flux[ID_WMOM * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
-      r * u * w - hv_coef * d3_vals[ID_WMOM];
-    d_flux[ID_RHOT * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
-      r * u * t - hv_coef * d3_vals[ID_RHOT];
-  }
 }
 
 __global__ void update_tendencies_x_kernel(double *d_flux, double *d_tend) {
@@ -671,9 +635,9 @@ __global__ void pack_x_halo( double *state, double *send_l, double *send_r ) {
   int k = (index / hs) % d_nz;
   int ll = index / (hs * d_nz);
 
-  int single_state_size = (d_nx+2*hs)*(d_nz+2*hs);
-  int row = ll * single_state_size 
-    + (k + hs) * (d_nx + 2 * hs);
+  int single_state_size = d_state_var_stride;
+  int row = ll * single_state_size
+    + (k + hs) * d_state_row_stride;
 
   // packing sends internal data to the halo
   send_l[index] = state[row + hs + s];
@@ -690,9 +654,9 @@ __global__ void unpack_x_halo( double *state, double *recv_l, double *recv_r ) {
   int k = (index / hs) % d_nz;
   int ll = index / (hs * d_nz);
 
-  int single_state_size = (d_nx+2*hs)*(d_nz+2*hs);
+  int single_state_size = d_state_var_stride;
   int row = ll * single_state_size
-    + (k + hs) * (d_nx + 2 * hs);
+    + (k + hs) * d_state_row_stride;
 
   state[row + s] = recv_l[index];
   state[row + d_nx + hs + s] = recv_r[index];
@@ -704,10 +668,10 @@ __global__ void set_halo_values_x_kernel( double *d_state ) {
   ll = blockIdx.y * blockDim.y + threadIdx.y;
 
   if (k < d_nz && ll < NUM_VARS) {
-    d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + 0        ] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + d_nx+hs-2];
-    d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + 1        ] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + d_nx+hs-1];
-    d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + d_nx+hs  ] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + hs     ];
-    d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + d_nx+hs+1] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + hs+1   ];
+    d_state[ll*d_state_var_stride + (k+hs)*d_state_row_stride + 0        ] = d_state[ll*d_state_var_stride + (k+hs)*d_state_row_stride + d_nx+hs-2];
+    d_state[ll*d_state_var_stride + (k+hs)*d_state_row_stride + 1        ] = d_state[ll*d_state_var_stride + (k+hs)*d_state_row_stride + d_nx+hs-1];
+    d_state[ll*d_state_var_stride + (k+hs)*d_state_row_stride + d_nx+hs  ] = d_state[ll*d_state_var_stride + (k+hs)*d_state_row_stride + hs     ];
+    d_state[ll*d_state_var_stride + (k+hs)*d_state_row_stride + d_nx+hs+1] = d_state[ll*d_state_var_stride + (k+hs)*d_state_row_stride + hs+1   ];
   }
 }
 
@@ -723,9 +687,9 @@ __global__ void data_spec_injection_kernel(double *d_state) {
     z = (d_k_beg + k+0.5)*dz;
 
     if (fabs(z-3*zlen/4) <= zlen/16) {
-      ind_r = ID_DENS*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + i;
-      ind_u = ID_UMOM*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + i;
-      ind_t = ID_RHOT*(d_nz+2*hs)*(d_nx+2*hs) + (k+hs)*(d_nx+2*hs) + i;
+      ind_r = ID_DENS*d_state_var_stride + (k+hs)*d_state_row_stride + i;
+      ind_u = ID_UMOM*d_state_var_stride + (k+hs)*d_state_row_stride + i;
+      ind_t = ID_RHOT*d_state_var_stride + (k+hs)*d_state_row_stride + i;
       d_state[ind_u] = (d_state[ind_r]+d_hy_dens_cell_ptr[k+hs]) * 50.;
       d_state[ind_t] = (d_state[ind_r]+d_hy_dens_cell_ptr[k+hs]) * 298. - d_hy_dens_theta_cell_ptr[k+hs];
     }
@@ -794,22 +758,22 @@ __global__ void set_halo_values_z_kernel(double *d_state) {
   i = blockDim.x * blockIdx.x + threadIdx.x;
   ll = blockDim.y * blockIdx.y + threadIdx.y;
 
-  if (i < d_nx + 2 * hs && ll < NUM_VARS) {
+  if (i < d_state_row_stride && ll < NUM_VARS) {
     if (ll == ID_WMOM) {
-      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (0        )*(d_nx+2*hs) + i] = 0.;
-      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (1        )*(d_nx+2*hs) + i] = 0.;
-      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs  )*(d_nx+2*hs) + i] = 0.;
-      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs+1)*(d_nx+2*hs) + i] = 0.;
+      d_state[ll*d_state_var_stride + (0        )*d_state_row_stride + i] = 0.;
+      d_state[ll*d_state_var_stride + (1        )*d_state_row_stride + i] = 0.;
+      d_state[ll*d_state_var_stride + (d_nz+hs  )*d_state_row_stride + i] = 0.;
+      d_state[ll*d_state_var_stride + (d_nz+hs+1)*d_state_row_stride + i] = 0.;
     } else if (ll == ID_UMOM) {
-      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (0        )*(d_nx+2*hs) + i] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (hs       )*(d_nx+2*hs) + i] / d_hy_dens_cell_ptr[hs       ] * d_hy_dens_cell_ptr[0        ];
-      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (1        )*(d_nx+2*hs) + i] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (hs       )*(d_nx+2*hs) + i] / d_hy_dens_cell_ptr[hs       ] * d_hy_dens_cell_ptr[1        ];
-      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs  )*(d_nx+2*hs) + i] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs-1)*(d_nx+2*hs) + i] / d_hy_dens_cell_ptr[d_nz+hs-1] * d_hy_dens_cell_ptr[d_nz+hs  ];
-      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs+1)*(d_nx+2*hs) + i] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs-1)*(d_nx+2*hs) + i] / d_hy_dens_cell_ptr[d_nz+hs-1] * d_hy_dens_cell_ptr[d_nz+hs+1];
+      d_state[ll*d_state_var_stride + (0        )*d_state_row_stride + i] = d_state[ll*d_state_var_stride + (hs       )*d_state_row_stride + i] / d_hy_dens_cell_ptr[hs       ] * d_hy_dens_cell_ptr[0        ];
+      d_state[ll*d_state_var_stride + (1        )*d_state_row_stride + i] = d_state[ll*d_state_var_stride + (hs       )*d_state_row_stride + i] / d_hy_dens_cell_ptr[hs       ] * d_hy_dens_cell_ptr[1        ];
+      d_state[ll*d_state_var_stride + (d_nz+hs  )*d_state_row_stride + i] = d_state[ll*d_state_var_stride + (d_nz+hs-1)*d_state_row_stride + i] / d_hy_dens_cell_ptr[d_nz+hs-1] * d_hy_dens_cell_ptr[d_nz+hs  ];
+      d_state[ll*d_state_var_stride + (d_nz+hs+1)*d_state_row_stride + i] = d_state[ll*d_state_var_stride + (d_nz+hs-1)*d_state_row_stride + i] / d_hy_dens_cell_ptr[d_nz+hs-1] * d_hy_dens_cell_ptr[d_nz+hs+1];
     } else {
-      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (0        )*(d_nx+2*hs) + i] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (hs       )*(d_nx+2*hs) + i];
-      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (1        )*(d_nx+2*hs) + i] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (hs       )*(d_nx+2*hs) + i];
-      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs  )*(d_nx+2*hs) + i] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs-1)*(d_nx+2*hs) + i];
-      d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs+1)*(d_nx+2*hs) + i] = d_state[ll*(d_nz+2*hs)*(d_nx+2*hs) + (d_nz+hs-1)*(d_nx+2*hs) + i];
+      d_state[ll*d_state_var_stride + (0        )*d_state_row_stride + i] = d_state[ll*d_state_var_stride + (hs       )*d_state_row_stride + i];
+      d_state[ll*d_state_var_stride + (1        )*d_state_row_stride + i] = d_state[ll*d_state_var_stride + (hs       )*d_state_row_stride + i];
+      d_state[ll*d_state_var_stride + (d_nz+hs  )*d_state_row_stride + i] = d_state[ll*d_state_var_stride + (d_nz+hs-1)*d_state_row_stride + i];
+      d_state[ll*d_state_var_stride + (d_nz+hs+1)*d_state_row_stride + i] = d_state[ll*d_state_var_stride + (d_nz+hs-1)*d_state_row_stride + i];
     }
   }
 }
@@ -1018,10 +982,14 @@ void device_init() {
   CUDA_CHECK(cudaMalloc((void**)&d_recvbuf_r, buffer_size * sizeof(double)));
 
   //Copy values for static device variables
+  int state_row_stride = nx + 2 * hs;
+  int state_var_stride = state_size / NUM_VARS;
   CUDA_CHECK(cudaMemcpyToSymbol(d_nx, &nx, sizeof(int)));
   CUDA_CHECK(cudaMemcpyToSymbol(d_nz, &nz, sizeof(int)));
   CUDA_CHECK(cudaMemcpyToSymbol(d_i_beg, &i_beg, sizeof(int)));
   CUDA_CHECK(cudaMemcpyToSymbol(d_k_beg, &k_beg, sizeof(int)));
+  CUDA_CHECK(cudaMemcpyToSymbol(d_state_row_stride, &state_row_stride, sizeof(int)));
+  CUDA_CHECK(cudaMemcpyToSymbol(d_state_var_stride, &state_var_stride, sizeof(int)));
 }
 
 
@@ -1311,13 +1279,13 @@ __global__ void reductions_kernel(double *d_state, double *mass_result, double *
 
   if (i < d_nx && k < d_nz) {
     int ind_r =
-      ID_DENS * (d_nz + 2 * hs) * (d_nx + 2 * hs) + (k + hs) * (d_nx + 2 * hs) + i + hs;
+      ID_DENS * d_state_var_stride + (k + hs) * d_state_row_stride + i + hs;
     int ind_u =
-      ID_UMOM * (d_nz + 2 * hs) * (d_nx + 2 * hs) + (k + hs) * (d_nx + 2 * hs) + i + hs;
+      ID_UMOM * d_state_var_stride + (k + hs) * d_state_row_stride + i + hs;
     int ind_w =
-      ID_WMOM * (d_nz + 2 * hs) * (d_nx + 2 * hs) + (k + hs) * (d_nx + 2 * hs) + i + hs;
+      ID_WMOM * d_state_var_stride + (k + hs) * d_state_row_stride + i + hs;
     int ind_t =
-      ID_RHOT * (d_nz + 2 * hs) * (d_nx + 2 * hs) + (k + hs) * (d_nx + 2 * hs) + i + hs;
+      ID_RHOT * d_state_var_stride + (k + hs) * d_state_row_stride + i + hs;
 
     double r = d_state[ind_r] + d_hy_dens_cell_ptr[hs + k];
     double u = d_state[ind_u] / r;

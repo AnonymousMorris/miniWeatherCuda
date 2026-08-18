@@ -29,7 +29,8 @@ function(add_cuda_reference_test case_name data_spec)
     _DATA_SPEC=${data_spec}
     NO_INFORM)
   target_compile_options(${target} PRIVATE -O3)
-  set_target_properties(${target} PROPERTIES CUDA_ARCHITECTURES "80")
+  set_target_properties(${target} PROPERTIES
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
   link_miniweather_dependencies(${target})
 
   string(TOUPPER "${case_name}" upper_case_name)
@@ -47,5 +48,6 @@ endfunction()
 
 add_cuda_reference_test(collision DATA_SPEC_COLLISION)
 add_cuda_reference_test(thermal DATA_SPEC_THERMAL)
+add_cuda_reference_test(gravity_waves DATA_SPEC_GRAVITY_WAVES)
 add_cuda_reference_test(density_current DATA_SPEC_DENSITY_CURRENT)
 add_cuda_reference_test(injection DATA_SPEC_INJECTION)

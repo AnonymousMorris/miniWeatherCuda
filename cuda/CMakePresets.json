@@ -35,7 +35,7 @@
         "CMAKE_CXX_COMPILER": "/opt/openmpi/bin/mpicxx",
         "CMAKE_CUDA_COMPILER": "/usr/local/cuda/bin/nvcc",
         "CMAKE_CUDA_HOST_COMPILER": "/usr/bin/g++",
-        "CMAKE_CUDA_ARCHITECTURES": "native",
+        "CMAKE_CUDA_ARCHITECTURES": "80",
         "CMAKE_CUDA_FLAGS": "-DNO_INFORM -I/opt/pnetcdf/include -I/opt/openmpi/include",
         "CXXFLAGS": "-O3 -DNO_INFORM -std=c++11 -I/opt/pnetcdf/include -I/opt/openmpi/include",
         "LDFLAGS": "-L/opt/pnetcdf/lib -L/opt/openmpi/lib -Wl,-rpath,/opt/pnetcdf/lib -Wl,-rpath,/opt/openmpi/lib -lpnetcdf",

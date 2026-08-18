@@ -18,7 +18,7 @@ Run the conservation and golden-reference tests:
 ctest --preset local
 ```
 
-The reference tests run 20-second collision, thermal, density-current, and injection simulations and compare their final output fields with saved OpenMP results. See [`cuda_test/README.md`](cuda_test/README.md) for details.
+The reference tests run 20-second collision, thermal, gravity-wave, density-current, and injection simulations and compare their final output fields with saved OpenMP results. See [`cuda_test/README.md`](cuda_test/README.md) for details.
 
 Run with one MPI rank:
 
