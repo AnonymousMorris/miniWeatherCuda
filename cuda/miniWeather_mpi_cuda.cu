@@ -479,7 +479,9 @@ __global__ void compute_tendencies_z_flux_kernel(double *d_state, double *d_flux
         hv_coef = -hv_beta * dz / (16 * dt);
 
         // Use fourth-order interpolation from four cell averages to compute the value at
-        // the interface in question
+        // the interface in question. Keep the loop rolled so vals and d3_vals use the
+        // per-thread stack instead of increasing register pressure.
+        #pragma unroll 1
         for (ll = 0; ll < NUM_VARS; ll++) {
             for (s = 0; s < sten_size; s++) {
                 inds = ll * (d_nz + 2 * hs) * (d_nx + 2 * hs) + (k + s) * (d_nx + 2 * hs) + i + hs;
