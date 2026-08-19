@@ -343,15 +343,19 @@ __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux
     i = blockIdx.x * blockDim.x + threadIdx.x;
     k = blockIdx.y * blockDim.y + threadIdx.y;
 
+    extern __shared__ double scratch[];
+    double *vals = scratch;
+    double *d3_vals = scratch + NUM_VARS * blockDim.x;
+
     if (i < d_nx + 1 && k < d_nz) {
-        double dens, dens_recip, umom, wmom, rhot, p, stencil[4], d3_vals[NUM_VARS], vals[NUM_VARS], hv_coef;
+        double dens, dens_recip, umom, wmom, rhot, p, stencil[4], hv_coef;
         // Compute the hyperviscosity coefficient
         hv_coef = -hv_beta * dx / (16 * dt);
 
         // Use fourth-order interpolation from four cell averages to compute the value at
         // the interface in question
-        // We forbid loop unrolling to force vals and d3_vals to spill onto stack. This
-        // reduces register pressure.
+        // Keep this loop rolled to limit register pressure. vals and d3_vals use
+        // explicit per-thread shared-memory scratch instead of the local stack.
         #pragma unroll 1
         for (ll = 0; ll < NUM_VARS; ll++) {
             for (s = 0; s < sten_size; s++) {
@@ -364,18 +368,20 @@ __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux
             //   + 7 * stencil[2] / 12 - stencil[3] / 12
             // Original third derivative:
             //   -stencil[0] + 3 * stencil[1] - 3 * stencil[2] + stencil[3]
-            vals[ll] =
+            int scratch_idx = ll * blockDim.x + threadIdx.x;
+            vals[scratch_idx] =
                 (7 * (stencil[1] + stencil[2]) - (stencil[0] + stencil[3])) / 12;
-            d3_vals[ll] =
+            d3_vals[scratch_idx] =
                 (stencil[3] - stencil[0]) + 3 * (stencil[1] - stencil[2]);
         }
 
         // Compute the interface conserved variables, reciprocal density, and pressure.
-        dens = vals[ID_DENS] + d_hy_dens_cell_ptr[k + hs];
+        dens = vals[ID_DENS * blockDim.x + threadIdx.x] + d_hy_dens_cell_ptr[k + hs];
         dens_recip = 1.0 / dens;
-        umom = vals[ID_UMOM];
-        wmom = vals[ID_WMOM];
-        rhot = vals[ID_RHOT] + d_hy_dens_theta_cell_ptr[k + hs];
+        umom = vals[ID_UMOM * blockDim.x + threadIdx.x];
+        wmom = vals[ID_WMOM * blockDim.x + threadIdx.x];
+        rhot = vals[ID_RHOT * blockDim.x + threadIdx.x]
+             + d_hy_dens_theta_cell_ptr[k + hs];
         // Original primitive-variable equivalents:
         //   r = dens
         //   u = umom * dens_recip
@@ -388,16 +394,19 @@ __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux
         // structure of the original primitive-variable equations in the comments below.
         // Original: r * u - hv_coef * d3_vals[ID_DENS]
         d_flux[ID_DENS * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
-            umom - hv_coef * d3_vals[ID_DENS];
+            umom - hv_coef * d3_vals[ID_DENS * blockDim.x + threadIdx.x];
         // Original: r * u * u + p - hv_coef * d3_vals[ID_UMOM]
         d_flux[ID_UMOM * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
-            umom * umom * dens_recip + p - hv_coef * d3_vals[ID_UMOM];
+            umom * umom * dens_recip + p
+          - hv_coef * d3_vals[ID_UMOM * blockDim.x + threadIdx.x];
         // Original: r * u * w - hv_coef * d3_vals[ID_WMOM]
         d_flux[ID_WMOM * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
-            umom * wmom * dens_recip - hv_coef * d3_vals[ID_WMOM];
+            umom * wmom * dens_recip
+          - hv_coef * d3_vals[ID_WMOM * blockDim.x + threadIdx.x];
         // Original: r * u * t - hv_coef * d3_vals[ID_RHOT]
         d_flux[ID_RHOT * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
-            umom * rhot * dens_recip - hv_coef * d3_vals[ID_RHOT];
+            umom * rhot * dens_recip
+          - hv_coef * d3_vals[ID_RHOT * blockDim.x + threadIdx.x];
     }
 }
 __host__ void compute_tendencies_x_flux_host(double *d_state, double *d_flux, double dt) {
@@ -405,7 +414,8 @@ __host__ void compute_tendencies_x_flux_host(double *d_state, double *d_flux, do
   dim3 grid_dim((nx + 1 + block_dim.x - 1) / block_dim.x, (nz + block_dim.y - 1) / block_dim.y,
                 1);
 
-  compute_tendencies_x_flux_kernel<<<grid_dim, block_dim>>>(d_state, d_flux, dt);
+  int smem_size = 2 * NUM_VARS * block_dim.x * sizeof(double);
+  compute_tendencies_x_flux_kernel<<<grid_dim, block_dim, smem_size>>>(d_state, d_flux, dt);
 
   CUDA_CHECK_KERNEL();
 }
@@ -446,14 +456,20 @@ __global__ void compute_tendencies_z_flux_kernel(double *d_state, double *d_flux
     i = blockIdx.x * blockDim.x + threadIdx.x;
     k = blockIdx.y * blockDim.y + threadIdx.y;
 
+    extern __shared__ double scratch[];
+    int scratch_stride = blockDim.x * blockDim.y;
+    int scratch_thread = threadIdx.y * blockDim.x + threadIdx.x;
+    double *vals = scratch;
+    double *d3_vals = scratch + NUM_VARS * scratch_stride;
+
     if (i < d_nx && k < d_nz + 1) {
-        double dens, dens_recip, umom, wmom, rhot, p, stencil[4], d3_vals[NUM_VARS], vals[NUM_VARS], hv_coef;
+        double dens, dens_recip, umom, wmom, rhot, p, stencil[4], hv_coef;
 
         hv_coef = -hv_beta * dz / (16 * dt);
 
         // Use fourth-order interpolation from four cell averages to compute the value at
-        // the interface in question. Keep the loop rolled so vals and d3_vals use the
-        // per-thread stack instead of increasing register pressure.
+        // the interface in question. Keep the loop rolled to limit register pressure;
+        // vals and d3_vals use explicit per-thread shared-memory scratch.
         #pragma unroll 1
         for (ll = 0; ll < NUM_VARS; ll++) {
             for (s = 0; s < sten_size; s++) {
@@ -466,18 +482,20 @@ __global__ void compute_tendencies_z_flux_kernel(double *d_state, double *d_flux
             //   + 7 * stencil[2] / 12 - stencil[3] / 12
             // Original third derivative:
             //   -stencil[0] + 3 * stencil[1] - 3 * stencil[2] + stencil[3]
-            vals[ll] =
+            int scratch_idx = ll * scratch_stride + scratch_thread;
+            vals[scratch_idx] =
                 (7 * (stencil[1] + stencil[2]) - (stencil[0] + stencil[3])) / 12;
-            d3_vals[ll] =
+            d3_vals[scratch_idx] =
                 (stencil[3] - stencil[0]) + 3 * (stencil[1] - stencil[2]);
         }
 
         // Compute the interface conserved variables, reciprocal density, and pressure.
-        dens = vals[ID_DENS] + d_hy_dens_int_ptr[k];
+        dens = vals[ID_DENS * scratch_stride + scratch_thread] + d_hy_dens_int_ptr[k];
         dens_recip = 1.0 / dens;
-        umom = vals[ID_UMOM];
-        wmom = vals[ID_WMOM];
-        rhot = vals[ID_RHOT] + d_hy_dens_theta_int_ptr[k];
+        umom = vals[ID_UMOM * scratch_stride + scratch_thread];
+        wmom = vals[ID_WMOM * scratch_stride + scratch_thread];
+        rhot = vals[ID_RHOT * scratch_stride + scratch_thread]
+             + d_hy_dens_theta_int_ptr[k];
         // Original primitive-variable equivalents:
         //   r = dens
         //   u = umom * dens_recip
@@ -488,23 +506,26 @@ __global__ void compute_tendencies_z_flux_kernel(double *d_state, double *d_flux
         // Enforce vertical boundary condition and exact mass conservation.
         if (k == 0 || k == d_nz) {
             wmom = 0;
-            d3_vals[ID_DENS] = 0;
+            d3_vals[ID_DENS * scratch_stride + scratch_thread] = 0;
         }
 
         // Compute the flux vector directly from conserved variables while preserving the
         // structure of the original primitive-variable equations in the comments below.
         // Original: r * w - hv_coef * d3_vals[ID_DENS]
         d_flux[ID_DENS * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
-            wmom - hv_coef * d3_vals[ID_DENS];
+            wmom - hv_coef * d3_vals[ID_DENS * scratch_stride + scratch_thread];
         // Original: r * w * u - hv_coef * d3_vals[ID_UMOM]
         d_flux[ID_UMOM * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
-            wmom * umom * dens_recip - hv_coef * d3_vals[ID_UMOM];
+            wmom * umom * dens_recip
+          - hv_coef * d3_vals[ID_UMOM * scratch_stride + scratch_thread];
         // Original: r * w * w + p - hv_coef * d3_vals[ID_WMOM]
         d_flux[ID_WMOM * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
-            wmom * wmom * dens_recip + p - hv_coef * d3_vals[ID_WMOM];
+            wmom * wmom * dens_recip + p
+          - hv_coef * d3_vals[ID_WMOM * scratch_stride + scratch_thread];
         // Original: r * w * t - hv_coef * d3_vals[ID_RHOT]
         d_flux[ID_RHOT * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
-            wmom * rhot * dens_recip - hv_coef * d3_vals[ID_RHOT];
+            wmom * rhot * dens_recip
+          - hv_coef * d3_vals[ID_RHOT * scratch_stride + scratch_thread];
     }
 }
 __host__ void compute_tendencies_z_flux_host(double *d_state, double *d_flux, double dt) {
@@ -512,7 +533,8 @@ __host__ void compute_tendencies_z_flux_host(double *d_state, double *d_flux, do
   dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, (nz + 1 + block_dim.y - 1) / block_dim.y,
       1);
 
-  compute_tendencies_z_flux_kernel<<<grid_dim, block_dim>>>(d_state, d_flux, dt);
+  int smem_size = 2 * NUM_VARS * block_dim.x * block_dim.y * sizeof(double);
+  compute_tendencies_z_flux_kernel<<<grid_dim, block_dim, smem_size>>>(d_state, d_flux, dt);
   CUDA_CHECK_KERNEL();
 }
 
