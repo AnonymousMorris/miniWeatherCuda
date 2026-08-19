@@ -390,12 +390,16 @@ __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux
                 inds = ll * (d_nz + 2 * hs) * (d_nx + 2 * hs) + (k + hs) * (d_nx + 2 * hs) + i + s;
                 stencil[s] = d_state[inds];
             }
-            // Fourth-order-accurate interpolation of the state
+            // Group symmetric stencil terms to reduce FP64 arithmetic.
+            // Original interpolation:
+            //   -stencil[0] / 12 + 7 * stencil[1] / 12
+            //   + 7 * stencil[2] / 12 - stencil[3] / 12
+            // Original third derivative:
+            //   -stencil[0] + 3 * stencil[1] - 3 * stencil[2] + stencil[3]
             vals[ll] =
-                -stencil[0] / 12 + 7 * stencil[1] / 12 + 7 * stencil[2] / 12 - stencil[3] / 12;
-            // First-order-accurate interpolation of the third spatial derivative of the
-            // state (for artificial viscosity)
-            d3_vals[ll] = -stencil[0] + 3 * stencil[1] - 3 * stencil[2] + stencil[3];
+                (7 * (stencil[1] + stencil[2]) - (stencil[0] + stencil[3])) / 12;
+            d3_vals[ll] =
+                (stencil[3] - stencil[0]) + 3 * (stencil[1] - stencil[2]);
         }
 
         // Compute the interface conserved variables, reciprocal density, and pressure.
@@ -487,12 +491,16 @@ __global__ void compute_tendencies_z_flux_kernel(double *d_state, double *d_flux
                 inds = ll * (d_nz + 2 * hs) * (d_nx + 2 * hs) + (k + s) * (d_nx + 2 * hs) + i + hs;
                 stencil[s] = d_state[inds];
             }
-            // Fourth-order-accurate interpolation of the state
+            // Group symmetric stencil terms to reduce FP64 arithmetic.
+            // Original interpolation:
+            //   -stencil[0] / 12 + 7 * stencil[1] / 12
+            //   + 7 * stencil[2] / 12 - stencil[3] / 12
+            // Original third derivative:
+            //   -stencil[0] + 3 * stencil[1] - 3 * stencil[2] + stencil[3]
             vals[ll] =
-                -stencil[0] / 12 + 7 * stencil[1] / 12 + 7 * stencil[2] / 12 - stencil[3] / 12;
-            // First-order-accurate interpolation of the third spatial derivative of the
-            // state
-            d3_vals[ll] = -stencil[0] + 3 * stencil[1] - 3 * stencil[2] + stencil[3];
+                (7 * (stencil[1] + stencil[2]) - (stencil[0] + stencil[3])) / 12;
+            d3_vals[ll] =
+                (stencil[3] - stencil[0]) + 3 * (stencil[1] - stencil[2]);
         }
 
         // Compute the interface conserved variables, reciprocal density, and pressure.
