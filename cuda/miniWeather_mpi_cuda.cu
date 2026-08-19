@@ -401,7 +401,7 @@ __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux
     }
 }
 __host__ void compute_tendencies_x_flux_host(double *d_state, double *d_flux, double dt) {
-  dim3 block_dim(512, 1, 1);
+  dim3 block_dim(128, 1, 1);
   dim3 grid_dim((nx + 1 + block_dim.x - 1) / block_dim.x, (nz + block_dim.y - 1) / block_dim.y,
                 1);
 
@@ -449,7 +449,7 @@ __global__ void compute_discrete_step_x_kernel(double *d_state_init, double *d_s
 
 void compute_discrete_step_x_host(double *state_init, double *state_out, double *flux,
                                   double dt) {
-  dim3 block_dim(256, 1, 1);
+  dim3 block_dim(64, 1, 1);
   dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, nz, NUM_VARS);
   int smem_size = (block_dim.x + 1) * sizeof(double);
 
@@ -525,7 +525,7 @@ __global__ void compute_tendencies_z_flux_kernel(double *d_state, double *d_flux
     }
 }
 __host__ void compute_tendencies_z_flux_host(double *d_state, double *d_flux, double dt) {
-  dim3 block_dim(512, 1, 1);
+  dim3 block_dim(128, 1, 1);
   dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, (nz + 1 + block_dim.y - 1) / block_dim.y,
       1);
 
@@ -596,7 +596,7 @@ __global__ void compute_discrete_step_z_kernel(double *d_state_init, double *d_s
 
 void compute_discrete_step_z_host(double *state_init, double *state_forcing, double *state_out,
                                   double *flux, double dt) {
-  dim3 block_dim(32, 8, 1);
+  dim3 block_dim(128, 1, 1);
   dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x,
                 (nz + block_dim.y - 1) / block_dim.y, 1);
   int smem_size = NUM_VARS * block_dim.x * (block_dim.y + 1) * sizeof(double);
