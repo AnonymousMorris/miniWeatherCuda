@@ -376,7 +376,7 @@ __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux
     k = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (i < d_nx + 1 && k < d_nz) {
-        double r, r_recip, u, w, t, p, stencil[4], d3_vals[NUM_VARS], vals[NUM_VARS], hv_coef;
+        double dens, dens_recip, umom, wmom, rhot, p, stencil[4], d3_vals[NUM_VARS], vals[NUM_VARS], hv_coef;
         // Compute the hyperviscosity coefficient
         hv_coef = -hv_beta * dx / (16 * dt);
 
@@ -398,24 +398,34 @@ __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux
             d3_vals[ll] = -stencil[0] + 3 * stencil[1] - 3 * stencil[2] + stencil[3];
         }
 
-        // Compute density, u-wind, w-wind, potential temperature, and pressure (r,u,w,t,p
-        // respectively)
-        r = vals[ID_DENS] + d_hy_dens_cell_ptr[k + hs];
-        r_recip = 1.0 / r;
-        u = vals[ID_UMOM] * r_recip;
-        w = vals[ID_WMOM] * r_recip;
-        t = (vals[ID_RHOT] + d_hy_dens_theta_cell_ptr[k + hs]) * r_recip;
-        p = C0 * pow((r * t), gamm);
+        // Compute the interface conserved variables, reciprocal density, and pressure.
+        dens = vals[ID_DENS] + d_hy_dens_cell_ptr[k + hs];
+        dens_recip = 1.0 / dens;
+        umom = vals[ID_UMOM];
+        wmom = vals[ID_WMOM];
+        rhot = vals[ID_RHOT] + d_hy_dens_theta_cell_ptr[k + hs];
+        // Original primitive-variable equivalents:
+        //   r = dens
+        //   u = umom * dens_recip
+        //   w = wmom * dens_recip
+        //   t = rhot * dens_recip
+        // Original primitive-variable form: p = C0 * pow(r * t, gamm).
+        p = C0 * pow(rhot, gamm);
 
-        // Compute the flux vector
+        // Compute the flux vector directly from conserved variables while preserving the
+        // structure of the original primitive-variable equations in the comments below.
+        // Original: r * u - hv_coef * d3_vals[ID_DENS]
         d_flux[ID_DENS * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
-            r * u - hv_coef * d3_vals[ID_DENS];
+            umom - hv_coef * d3_vals[ID_DENS];
+        // Original: r * u * u + p - hv_coef * d3_vals[ID_UMOM]
         d_flux[ID_UMOM * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
-            r * u * u + p - hv_coef * d3_vals[ID_UMOM];
+            umom * umom * dens_recip + p - hv_coef * d3_vals[ID_UMOM];
+        // Original: r * u * w - hv_coef * d3_vals[ID_WMOM]
         d_flux[ID_WMOM * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
-            r * u * w - hv_coef * d3_vals[ID_WMOM];
+            umom * wmom * dens_recip - hv_coef * d3_vals[ID_WMOM];
+        // Original: r * u * t - hv_coef * d3_vals[ID_RHOT]
         d_flux[ID_RHOT * (d_nz + 1) * (d_nx + 1) + k * (d_nx + 1) + i] =
-            r * u * t - hv_coef * d3_vals[ID_RHOT];
+            umom * rhot * dens_recip - hv_coef * d3_vals[ID_RHOT];
     }
 }
 __host__ void compute_tendencies_x_flux_host(double *d_state, double *d_flux, double dt) {
