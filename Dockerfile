@@ -10,6 +10,7 @@ RUN apt-get update \
       ca-certificates \
       cmake \
       cuda-nsight-systems-12-6 \
+      gcc-13-offload-nvptx \
       git \
       m4 \
       nvtop \
@@ -21,6 +22,39 @@ RUN apt-get update \
       tmux \
       vim \
  && rm -rf /var/lib/apt/lists/*
+
+# Fail the image build unless GNU OpenACC offload compilation and CUDA work.
+RUN <<'EOF'
+set -eux
+cat > /tmp/openacc-smoke.cpp <<'CPP'
+#include <cmath>
+
+void square(double *values, int count) {
+#pragma acc parallel loop present(values[0:count])
+  for (int i = 0; i < count; ++i) {
+    values[i] = std::pow(values[i], 2.0);
+  }
+}
+
+int main() {
+  double values[4] = {1.0, 2.0, 3.0, 4.0};
+#pragma acc data copy(values[0:4])
+  {
+    square(values, 4);
+  }
+  return values[3] == 16.0 ? 0 : 1;
+}
+CPP
+g++ -O2 \
+  -fopenacc \
+  -foffload-options=nvptx-none=-fcf-protection=none \
+  -foffload-options=nvptx-none=-lm \
+  /tmp/openacc-smoke.cpp \
+  -o /tmp/openacc-smoke
+/tmp/openacc-smoke
+/usr/local/cuda/bin/nvcc --version
+rm -f /tmp/openacc-smoke /tmp/openacc-smoke.cpp
+EOF
 
 # Install the test runner used by the CUDA reference tests.
 RUN python3 -m venv /opt/uv \
