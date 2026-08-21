@@ -296,6 +296,26 @@ void perform_timestep( double *d_state , double *d_state_tmp , double *d_flux , 
 
 }
 
+__device__ __forceinline__ double divide_interpolation_numerator(double numerator) {
+  constexpr unsigned long long magnitude_mask = 0x7fffffffffffffffULL;
+  // 0x0048000000000000 encodes 12 * DBL_MIN. Smaller magnitudes can produce
+  // subnormal quotients, for which the compensated path can differ by one ULP.
+  constexpr unsigned long long minimum_normal_dividend = 0x0048000000000000ULL;
+  constexpr unsigned long long infinity = 0x7ff0000000000000ULL;
+  unsigned long long magnitude =
+      static_cast<unsigned long long>(__double_as_longlong(numerator)) & magnitude_mask;
+
+  // Preserve hardware-division behavior for signed zero, infinity, NaN, and
+  // quotients that may be subnormal.
+  if (magnitude == 0 || magnitude == infinity) return numerator;
+  if (magnitude < minimum_normal_dividend || magnitude > infinity) return numerator / 12.0;
+
+  constexpr double reciprocal = 0x1.5555555555555p-4;
+  double quotient = numerator * reciprocal;
+  double remainder = fma(-quotient, 12.0, numerator);
+  return fma(remainder, reciprocal, quotient);
+}
+
 __device__ double gravity_wave_source(int i, int k) {
   double x = (d_i_beg + i + 0.5) * dx;
   double z = (d_k_beg + k + 0.5) * dz;
@@ -369,8 +389,8 @@ __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux
             // Original third derivative:
             //   -stencil[0] + 3 * stencil[1] - 3 * stencil[2] + stencil[3]
             int scratch_idx = ll * blockDim.x + threadIdx.x;
-            vals[scratch_idx] =
-                (7 * (stencil[1] + stencil[2]) - (stencil[0] + stencil[3])) / 12;
+            vals[scratch_idx] = divide_interpolation_numerator(
+                7 * (stencil[1] + stencil[2]) - (stencil[0] + stencil[3]));
             d3_vals[scratch_idx] =
                 (stencil[3] - stencil[0]) + 3 * (stencil[1] - stencil[2]);
         }
@@ -483,8 +503,8 @@ __global__ void compute_tendencies_z_flux_kernel(double *d_state, double *d_flux
             // Original third derivative:
             //   -stencil[0] + 3 * stencil[1] - 3 * stencil[2] + stencil[3]
             int scratch_idx = ll * scratch_stride + scratch_thread;
-            vals[scratch_idx] =
-                (7 * (stencil[1] + stencil[2]) - (stencil[0] + stencil[3])) / 12;
+            vals[scratch_idx] = divide_interpolation_numerator(
+                7 * (stencil[1] + stencil[2]) - (stencil[0] + stencil[3]));
             d3_vals[scratch_idx] =
                 (stencil[3] - stencil[0]) + 3 * (stencil[1] - stencil[2]);
         }
