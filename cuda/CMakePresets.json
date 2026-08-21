@@ -33,7 +33,7 @@
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_POLICY_VERSION_MINIMUM": "3.5",
         "CMAKE_CXX_COMPILER": "/opt/openmpi/bin/mpicxx",
-        "CMAKE_CUDA_COMPILER": "/usr/local/cuda/bin/nvcc",
+        "CMAKE_CUDA_COMPILER": "nvcc",
         "CMAKE_CUDA_HOST_COMPILER": "/usr/bin/g++",
         "CMAKE_CUDA_ARCHITECTURES": "native",
         "CMAKE_CUDA_FLAGS": "-DNO_INFORM -I/opt/pnetcdf/include -I/opt/openmpi/include",

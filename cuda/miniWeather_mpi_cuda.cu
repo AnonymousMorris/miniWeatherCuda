@@ -296,6 +296,26 @@ void perform_timestep( double *d_state , double *d_state_tmp , double *d_flux , 
 
 }
 
+__device__ __forceinline__ double divide_interpolation_numerator(double numerator) {
+  constexpr unsigned long long magnitude_mask = 0x7fffffffffffffffULL;
+  // 0x0048000000000000 encodes 12 * DBL_MIN. Smaller magnitudes can produce
+  // subnormal quotients, for which the compensated path can differ by one ULP.
+  constexpr unsigned long long minimum_normal_dividend = 0x0048000000000000ULL;
+  constexpr unsigned long long infinity = 0x7ff0000000000000ULL;
+  unsigned long long magnitude =
+      static_cast<unsigned long long>(__double_as_longlong(numerator)) & magnitude_mask;
+
+  // Preserve hardware-division behavior for signed zero, infinity, NaN, and
+  // quotients that may be subnormal.
+  if (magnitude == 0 || magnitude == infinity) return numerator;
+  if (magnitude < minimum_normal_dividend || magnitude > infinity) return numerator / 12.0;
+
+  constexpr double reciprocal = 0x1.5555555555555p-4;
+  double quotient = numerator * reciprocal;
+  double remainder = fma(-quotient, 12.0, numerator);
+  return fma(remainder, reciprocal, quotient);
+}
+
 __device__ double gravity_wave_source(int i, int k) {
   double x = (d_i_beg + i + 0.5) * dx;
   double z = (d_k_beg + k + 0.5) * dz;
@@ -338,7 +358,7 @@ void semi_discrete_step( double *state_init , double *state_forcing , double *st
   }
 }
 
-__global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux, double dt ) {
+__global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux, double hv_coef) {
     int i, k, ll, s, inds;
     i = blockIdx.x * blockDim.x + threadIdx.x;
     k = blockIdx.y * blockDim.y + threadIdx.y;
@@ -348,9 +368,7 @@ __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux
     double *d3_vals = scratch + NUM_VARS * blockDim.x;
 
     if (i < d_nx + 1 && k < d_nz) {
-        double dens, dens_recip, umom, wmom, rhot, p, stencil[4], hv_coef;
-        // Compute the hyperviscosity coefficient
-        hv_coef = -hv_beta * dx / (16 * dt);
+        double dens, dens_recip, umom, wmom, rhot, p, stencil[4];
 
         // Use fourth-order interpolation from four cell averages to compute the value at
         // the interface in question
@@ -369,8 +387,8 @@ __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux
             // Original third derivative:
             //   -stencil[0] + 3 * stencil[1] - 3 * stencil[2] + stencil[3]
             int scratch_idx = ll * blockDim.x + threadIdx.x;
-            vals[scratch_idx] =
-                (7 * (stencil[1] + stencil[2]) - (stencil[0] + stencil[3])) / 12;
+            vals[scratch_idx] = divide_interpolation_numerator(
+                7 * (stencil[1] + stencil[2]) - (stencil[0] + stencil[3]));
             d3_vals[scratch_idx] =
                 (stencil[3] - stencil[0]) + 3 * (stencil[1] - stencil[2]);
         }
@@ -414,8 +432,9 @@ __host__ void compute_tendencies_x_flux_host(double *d_state, double *d_flux, do
   dim3 grid_dim((nx + 1 + block_dim.x - 1) / block_dim.x, (nz + block_dim.y - 1) / block_dim.y,
                 1);
 
+  double hv_coef = -hv_beta * dx / (16 * dt);
   int smem_size = 2 * NUM_VARS * block_dim.x * sizeof(double);
-  compute_tendencies_x_flux_kernel<<<grid_dim, block_dim, smem_size>>>(d_state, d_flux, dt);
+  compute_tendencies_x_flux_kernel<<<grid_dim, block_dim, smem_size>>>(d_state, d_flux, hv_coef);
 
   CUDA_CHECK_KERNEL();
 }
@@ -468,7 +487,7 @@ void compute_discrete_step_x_host(double *state_init, double *state_out, double 
 }
 
 
-__global__ void compute_tendencies_z_flux_kernel(double *d_state, double *d_flux, double dt) {
+__global__ void compute_tendencies_z_flux_kernel(double *d_state, double *d_flux, double hv_coef) {
     int i, k, ll, s, inds;
     i = blockIdx.x * blockDim.x + threadIdx.x;
     k = blockIdx.y * blockDim.y + threadIdx.y;
@@ -480,9 +499,7 @@ __global__ void compute_tendencies_z_flux_kernel(double *d_state, double *d_flux
     double *d3_vals = scratch + NUM_VARS * scratch_stride;
 
     if (i < d_nx && k < d_nz + 1) {
-        double dens, dens_recip, umom, wmom, rhot, p, stencil[4], hv_coef;
-
-        hv_coef = -hv_beta * dz / (16 * dt);
+        double dens, dens_recip, umom, wmom, rhot, p, stencil[4];
 
         // Use fourth-order interpolation from four cell averages to compute the value at
         // the interface in question. Keep the loop rolled to limit register pressure;
@@ -500,8 +517,8 @@ __global__ void compute_tendencies_z_flux_kernel(double *d_state, double *d_flux
             // Original third derivative:
             //   -stencil[0] + 3 * stencil[1] - 3 * stencil[2] + stencil[3]
             int scratch_idx = ll * scratch_stride + scratch_thread;
-            vals[scratch_idx] =
-                (7 * (stencil[1] + stencil[2]) - (stencil[0] + stencil[3])) / 12;
+            vals[scratch_idx] = divide_interpolation_numerator(
+                7 * (stencil[1] + stencil[2]) - (stencil[0] + stencil[3]));
             d3_vals[scratch_idx] =
                 (stencil[3] - stencil[0]) + 3 * (stencil[1] - stencil[2]);
         }
@@ -550,8 +567,9 @@ __host__ void compute_tendencies_z_flux_host(double *d_state, double *d_flux, do
   dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, (nz + 1 + block_dim.y - 1) / block_dim.y,
       1);
 
+  double hv_coef = -hv_beta * dz / (16 * dt);
   int smem_size = 2 * NUM_VARS * block_dim.x * block_dim.y * sizeof(double);
-  compute_tendencies_z_flux_kernel<<<grid_dim, block_dim, smem_size>>>(d_state, d_flux, dt);
+  compute_tendencies_z_flux_kernel<<<grid_dim, block_dim, smem_size>>>(d_state, d_flux, hv_coef);
   CUDA_CHECK_KERNEL();
 }
 
