@@ -358,7 +358,7 @@ void semi_discrete_step( double *state_init , double *state_forcing , double *st
   }
 }
 
-__global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux, double dt ) {
+__global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux, double hv_coef) {
     int i, k, ll, s, inds;
     i = blockIdx.x * blockDim.x + threadIdx.x;
     k = blockIdx.y * blockDim.y + threadIdx.y;
@@ -368,9 +368,7 @@ __global__ void compute_tendencies_x_flux_kernel(double *d_state, double *d_flux
     double *d3_vals = scratch + NUM_VARS * blockDim.x;
 
     if (i < d_nx + 1 && k < d_nz) {
-        double dens, dens_recip, umom, wmom, rhot, p, stencil[4], hv_coef;
-        // Compute the hyperviscosity coefficient
-        hv_coef = -hv_beta * dx / (16 * dt);
+        double dens, dens_recip, umom, wmom, rhot, p, stencil[4];
 
         // Use fourth-order interpolation from four cell averages to compute the value at
         // the interface in question
@@ -434,8 +432,9 @@ __host__ void compute_tendencies_x_flux_host(double *d_state, double *d_flux, do
   dim3 grid_dim((nx + 1 + block_dim.x - 1) / block_dim.x, (nz + block_dim.y - 1) / block_dim.y,
                 1);
 
+  double hv_coef = -hv_beta * dx / (16 * dt);
   int smem_size = 2 * NUM_VARS * block_dim.x * sizeof(double);
-  compute_tendencies_x_flux_kernel<<<grid_dim, block_dim, smem_size>>>(d_state, d_flux, dt);
+  compute_tendencies_x_flux_kernel<<<grid_dim, block_dim, smem_size>>>(d_state, d_flux, hv_coef);
 
   CUDA_CHECK_KERNEL();
 }
@@ -488,7 +487,7 @@ void compute_discrete_step_x_host(double *state_init, double *state_out, double 
 }
 
 
-__global__ void compute_tendencies_z_flux_kernel(double *d_state, double *d_flux, double dt) {
+__global__ void compute_tendencies_z_flux_kernel(double *d_state, double *d_flux, double hv_coef) {
     int i, k, ll, s, inds;
     i = blockIdx.x * blockDim.x + threadIdx.x;
     k = blockIdx.y * blockDim.y + threadIdx.y;
@@ -500,9 +499,7 @@ __global__ void compute_tendencies_z_flux_kernel(double *d_state, double *d_flux
     double *d3_vals = scratch + NUM_VARS * scratch_stride;
 
     if (i < d_nx && k < d_nz + 1) {
-        double dens, dens_recip, umom, wmom, rhot, p, stencil[4], hv_coef;
-
-        hv_coef = -hv_beta * dz / (16 * dt);
+        double dens, dens_recip, umom, wmom, rhot, p, stencil[4];
 
         // Use fourth-order interpolation from four cell averages to compute the value at
         // the interface in question. Keep the loop rolled to limit register pressure;
@@ -570,8 +567,9 @@ __host__ void compute_tendencies_z_flux_host(double *d_state, double *d_flux, do
   dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, (nz + 1 + block_dim.y - 1) / block_dim.y,
       1);
 
+  double hv_coef = -hv_beta * dz / (16 * dt);
   int smem_size = 2 * NUM_VARS * block_dim.x * block_dim.y * sizeof(double);
-  compute_tendencies_z_flux_kernel<<<grid_dim, block_dim, smem_size>>>(d_state, d_flux, dt);
+  compute_tendencies_z_flux_kernel<<<grid_dim, block_dim, smem_size>>>(d_state, d_flux, hv_coef);
   CUDA_CHECK_KERNEL();
 }
 
