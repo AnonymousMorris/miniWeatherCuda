@@ -316,6 +316,28 @@ __device__ __forceinline__ double divide_interpolation_numerator(double numerato
   return fma(remainder, reciprocal, quotient);
 }
 
+__device__ __forceinline__ double divide_by_dx(double numerator) {
+  constexpr unsigned long long magnitude_mask = 0x7fffffffffffffffULL;
+  constexpr unsigned long long infinity = 0x7ff0000000000000ULL;
+  unsigned long long magnitude =
+      static_cast<unsigned long long>(__double_as_longlong(numerator)) & magnitude_mask;
+
+  // Preserve hardware-division behavior for signed zero, infinity, NaN, and
+  // quotients that may be subnormal.
+  if (magnitude == 0 || magnitude == infinity) return numerator;
+  double absolute_numerator =
+      __longlong_as_double(static_cast<long long>(magnitude));
+  constexpr double minimum_normal_dividend = dx * 0x1p-1022;
+  if (absolute_numerator < minimum_normal_dividend || magnitude > infinity) {
+    return numerator / dx;
+  }
+
+  constexpr double reciprocal = 1.0 / dx;
+  double quotient = numerator * reciprocal;
+  double remainder = fma(-quotient, dx, numerator);
+  return fma(remainder, reciprocal, quotient);
+}
+
 __device__ double gravity_wave_source(int i, int k) {
   double x = (d_i_beg + i + 0.5) * dx;
   double z = (d_k_beg + k + 0.5) * dz;
@@ -449,7 +471,9 @@ __global__ void compute_discrete_step_x_kernel(double *d_state_init, double *d_s
     int flux_row_stride = d_nx + 1;
     int flux_var_stride = (d_nz + 1) * flux_row_stride;
     int flux_idx = ll * flux_var_stride + k * flux_row_stride + i;
-    double tendency = -(d_flux[flux_idx + 1] - d_flux[flux_idx]) / dx;
+    // double tendency = -(d_flux[flux_idx + 1] - d_flux[flux_idx]) / dx;
+    double tendency = divide_by_dx(-(d_flux[flux_idx + 1] - d_flux[flux_idx]));
+
     if (data_spec_int == DATA_SPEC_GRAVITY_WAVES && ll == ID_WMOM) {
       tendency += gravity_wave_source(i,k);
     }
@@ -463,7 +487,7 @@ __global__ void compute_discrete_step_x_kernel(double *d_state_init, double *d_s
 
 void compute_discrete_step_x_host(double *state_init, double *state_out, double *flux,
                                   double dt) {
-  dim3 block_dim(64, 1, 1);
+  dim3 block_dim(128, 1, 1);
   dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, nz, NUM_VARS);
   compute_discrete_step_x_kernel<<<grid_dim,block_dim>>>(state_init,state_out,flux,dt);
   CUDA_CHECK_KERNEL();
@@ -546,7 +570,7 @@ __global__ void compute_tendencies_z_flux_kernel(double *d_state, double *d_flux
     }
 }
 __host__ void compute_tendencies_z_flux_host(double *d_state, double *d_flux, double dt) {
-  dim3 block_dim(128, 1, 1);
+  dim3 block_dim(32, 8, 1);
   dim3 grid_dim((nx + block_dim.x - 1) / block_dim.x, (nz + 1 + block_dim.y - 1) / block_dim.y,
       1);
 
@@ -580,7 +604,8 @@ __global__ void compute_discrete_step_z_kernel(double *d_state_init, double *d_s
 
     for (int ll = 0; ll < NUM_VARS; ll++) {
       int flux_idx = ll * flux_var_stride + k * flux_row_stride + i;
-      double tendency = -(d_flux[flux_idx + flux_row_stride] - d_flux[flux_idx]) / dz;
+      // double tendency = -(d_flux[flux_idx + flux_row_stride] - d_flux[flux_idx]) / dz;
+      double tendency = divide_by_dx(-(d_flux[flux_idx + flux_row_stride] - d_flux[flux_idx]));
       if (ll == ID_WMOM) {
         tendency -= forcing_density * grav;
         tendency += wave_source;
